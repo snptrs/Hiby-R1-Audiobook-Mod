@@ -610,7 +610,7 @@ static int framebuffer_unblank(int fb_fd) {
 
 /* Lightweight blank: backlight off only. We keep panning (touch IC stays
  * alive) and the decode thread runs (audiobook plays with the screen dark).
- * Wake on a power press or any other hardware key; NOT on touch. */
+ * Wake on a power press only: not on touch, not on any other key. */
 static void set_blanked(ui_state_t *ui, int on, int fb_fd) {
     if (on) {
         int was_blanked = ui->blanked;
@@ -1071,7 +1071,7 @@ int ui_run(uint16_t *fb, int fb_fd) {
                          * technically possible, but it also means anything
                          * brushing the screen in a pocket would light it up and
                          * burn battery mid-listen. Wake is the power button's
-                         * job (and any other hardware key, handled below).
+                         * job alone; no other key wakes it either.
                          *
                          * Events are still READ and discarded rather than left
                          * unread: the fd is level-triggered, so ignoring it
@@ -1098,15 +1098,17 @@ int ui_run(uint16_t *fb, int fb_fd) {
                                ev.code, ev.code, ev.value, ui->key_fds[i],
                                (unsigned long long)now_ms());
                     }
-                    /* Every non-power key performs an idempotent framebuffer
-                     * wake before its normal action. This also recovers a hard
-                     * blank whose brightness value stayed nonzero. */
-                    if (ev.value == 1 && ev.code != KEY_POWER) {
-                        if (ui->blanked)
-                            set_blanked(ui, 0, fb_fd);
-                        else
-                            framebuffer_unblank(fb_fd);
-                    }
+                    /* Only the power button lights the screen. Every other key
+                     * still performs its action with the screen dark: volume,
+                     * play/pause and the skip keys all work below without
+                     * caring about ui->blanked.
+                     *
+                     * The idempotent framebuffer wake recovers a STOCK hard
+                     * blank whose brightness value stayed nonzero, so it is
+                     * gated on our own blank not being in effect. Without that
+                     * gate, nudging the volume would light the screen back up. */
+                    if (ev.value == 1 && ev.code != KEY_POWER && !ui->blanked)
+                        framebuffer_unblank(fb_fd);
                     /* The R1 driver does not reliably emit value=2 repeats.
                      * Track volume down/up ourselves and let the event-loop
                      * timer ramp while held. Consume all volume events here. */
@@ -1185,7 +1187,7 @@ int ui_run(uint16_t *fb, int fb_fd) {
                 && errno == EBUSY) {
                 /* A hard FBIOBLANK makes pan return EBUSY while brightness
                  * may still report a nonzero value. Convert it to our
-                 * lightweight blank so the next power press or hardware key
+                 * lightweight blank so the next power press
                  * reliably wakes the panel. */
                 ui_log("[ui] hard blank detected from pan EBUSY\n");
                 set_blanked(ui, 1, fb_fd);

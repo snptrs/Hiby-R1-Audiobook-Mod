@@ -4,9 +4,11 @@ All public releases are for the normal HiBy R1 on stock firmware 1.6. Do not ins
 
 ## Unreleased - podcast support
 
-### Changed: the touchscreen no longer wakes a blanked screen
+### Changed: only the power button wakes a blanked screen
 
-Only the power button (and any other hardware key) wakes it now. The blank is
+Neither the touchscreen nor any other hardware key wakes it now. Volume,
+play/pause and the skip keys still do their job with the screen dark, they just
+no longer light it up, so nothing in a pocket can. The blank is
 backlight-only so the touch controller stays powered, which is what made a wake
 gesture possible in the first place, but it also meant anything brushing the
 screen in a pocket lit it up and burned battery mid-listen. Touch events while

@@ -129,9 +129,10 @@ typedef struct {
 
     /* Screen blank (power button). Lightweight: backlight off only — we keep
      * panning so the touch controller and display loop stay alive and the decode
-     * thread keeps running (audiobook plays with the screen dark). The
-     * touchscreen does NOT wake: only the power button and other hardware keys
-     * do, so a pocket brush cannot light the screen up mid-listen. */
+     * thread keeps running (audiobook plays with the screen dark). Only the
+     * POWER button wakes it: neither the touchscreen nor any other key does, so
+     * nothing in a pocket can light the screen up mid-listen. Volume,
+     * play/pause and the skip keys still act with the screen dark. */
     int blanked;             /* 1 = screen blanked (backlight off) */
     int saved_brightness;    /* brightness to restore on wake */
 
