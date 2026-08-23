@@ -548,37 +548,42 @@ def plan(args, device: dict[str, dict], targets: dict[str, dict],
 
 
 def device_clock_ok(device: dict[str, dict]) -> tuple[bool, str]:
-    """Are the device's .pos timestamps usable for ordering against ABS?
+    """Detect a device clock running AHEAD, the only direction a .pos can show.
 
-    Ordering compares them against ABS lastUpdate, so a device clock running
-    AHEAD is the dangerous direction: a .pos written at real time T looks like
-    T+skew, so it beats any ABS change made in that window even though ABS is
-    genuinely newer. A clock running behind biases the other way, which the
-    no-regression guard already limits. The Mac's clock is assumed sane.
+    Ordering compares .pos timestamps against ABS lastUpdate, so skew matters.
+    But the evidence is one-sided:
 
-    Report the direction explicitly. Saying only "0.5h from now" hides which
-    way, and the two directions differ in how much they can hurt.
+      AHEAD  is detectable. A save timestamped in the future is impossible with
+             a correct clock, so it proves skew. It is also the dangerous
+             direction: a .pos written at real time T looks like T+skew and
+             beats any ABS change made inside that window.
+
+      BEHIND is NOT detectable here. The newest .pos is simply when the user
+             last listened, so a timestamp in the past is normal and says
+             nothing about the clock. An earlier version subtracted now from it
+             and reported ordinary usage as "39 min BEHIND", which was just
+             wrong: a device untouched for a week would have read as a week
+             behind.
+
+    So a clock running behind can slip through, biasing ordering toward ABS.
+    The symmetric no-rewind guard is what limits the damage there.
     """
     stamps = [d["pos"]["saved_at"] for d in device.values() if d["pos"]]
     if not stamps:
         return True, "no saved positions to check"
-    skew = max(stamps) - int(time.time())
-    if skew > CLOCK_SKEW_TOLERANCE_S:
-        return False, (f"device clock is {skew / 3600:.1f}h AHEAD of this Mac; "
-                       f"refusing to pull, positions cannot be ordered")
-    if abs(skew) <= CLOCK_WARN_AHEAD_S:
-        return True, f"device clock within {abs(skew) / 60:.0f} min of this Mac"
-    # Beyond the warn threshold, always name the direction. Reporting a bare
-    # "within 35 min" reads like a pass and hides which way it leans, which is
-    # the whole reason for reporting it.
-    if skew > 0:
-        return True, (f"WARNING device clock is ~{skew / 60:.0f} min AHEAD of "
-                      f"this Mac, so a device position can wrongly beat an ABS "
-                      f"change made inside that window. Set the R1's clock.")
-    return True, (f"WARNING device clock is ~{-skew / 60:.0f} min BEHIND this "
-                  f"Mac, so real device listening can lose to older ABS state. "
-                  f"Less harmful than running ahead (the no-rewind guard "
-                  f"catches the common case) but set the R1's clock.")
+    ahead = max(stamps) - int(time.time())
+    if ahead > CLOCK_SKEW_TOLERANCE_S:
+        return False, (f"a saved position is dated {ahead / 3600:.1f}h in the "
+                       f"future, so the device clock is ahead; refusing to "
+                       f"pull, positions cannot be ordered")
+    if ahead > CLOCK_WARN_AHEAD_S:
+        return True, (f"WARNING a saved position is dated ~{ahead / 60:.0f} min "
+                      f"in the future, so the device clock is ahead and a "
+                      f"device position can wrongly beat a newer ABS change. "
+                      f"Set the R1's clock.")
+    age = -ahead
+    return True, (f"no clock skew detected (newest saved position is "
+                  f"{age / 60:.0f} min old)")
 
 
 def run_check(args) -> int:

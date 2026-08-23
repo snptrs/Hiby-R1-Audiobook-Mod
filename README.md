@@ -155,11 +155,13 @@ Behaviours worth knowing:
 - **A few seconds of playback is not a position.** An unfinished position below
   30s is ignored on both sides, so a stray tap does not become a Continue
   Listening entry. Tune with `--min-position-secs`; finishing is always synced.
-- **Pulling refuses to run if the device clock looks wrong.** Ordering depends
-  on the `.pos` timestamps, so a device clock in the future would let stale
-  state overwrite good state on the card. A clock running ahead is the
-  dangerous direction: it warns above two minutes and refuses above an hour.
-  Set the R1's clock if you see the warning.
+- **Pulling refuses to run if a saved position is dated in the future.**
+  Ordering depends on the `.pos` timestamps, and a device clock running ahead
+  would let stale card state beat a newer ABS change. Only that direction is
+  detectable: a timestamp in the past is simply when you last listened, so it
+  says nothing about the clock. A clock running behind can therefore slip
+  through and bias ordering toward ABS, which is what the no-rewind guard is
+  there to limit.
 - **A multi-file audiobook is skipped unless the device and ABS agree on its
   total duration.** The device sums its own track durations in its own order
   and ABS concatenates in its; if the totals disagree the timelines differ and

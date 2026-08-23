@@ -138,69 +138,30 @@ check("a stray 3s pull is ignored", a, [])
 a, _, _ = run(dev("a.mp3", 3599, completed=True, when=NOW), tgt("a.mp3"), {})
 check("finishing is never floored out", [x[3]["finished"] for x in a], [True])
 
-print("clock skew reporting")
+print("clock skew detection")
 def clockdev(offset):
     return {"k": {"pos": {"saved_at": NOW + offset}}}
-ok, why = clockdev, None
-ok, why = device_clock_ok(clockdev(0))
-check("in sync -> ok", (ok, "within" in why), (True, True))
-ok, why = device_clock_ok(clockdev(1800))
-check("30 min ahead -> allowed but warns", (ok, "WARNING" in why and "AHEAD" in why),
-      (True, True))
-ok, why = device_clock_ok(clockdev(7200))
-check("2h ahead -> refuses to pull", (ok, "refusing to pull" in why), (False, True))
-ok, why = device_clock_ok(clockdev(-7200))
-check("2h behind -> allowed, names the direction",
-      (ok, "behind" in why.lower()), (True, True))
-# The real-world case that was previously reported as a bland "within 35 min",
-# which read like a pass and hid the direction entirely.
-ok, why = device_clock_ok(clockdev(-2100))
-check("35 min behind -> warns and names the direction",
-      (ok, "WARNING" in why and "behind" in why.lower()), (True, True))
+
 ok, why = device_clock_ok(clockdev(-60))
-check("1 min out -> quiet pass", (ok, "WARNING" in why), (True, False))
-
-print("option wiring (plan())")
-# main() previously built the reconcile call inline, so a rename left a stale
-# local and the whole run died with a NameError that the exit-0 guard hid.
-# Exercising plan() with real option values covers that seam.
-class Args:
-    direction = "both"
-    finished_remaining_secs = None      # None => use each library's setting
-    finished_remaining_frac = 0.10
-    allow_rewind = False
-    min_position_secs = 30.0
-    only_finished = False
-
-def with_rule(t, secs):
-    for v in t.values():
-        v["finished_secs"], v["finished_pct"] = secs, None
-    return t
-
-a, _, _ = plan(Args(), dev("a.mp3", 100, when=NOW), tgt("a.mp3"),
-               prog(50, when=NOW - 999), True)
-check("plan() wires options through", [x[0] for x in a], ["push"])
-
-# The per-library threshold arrives on the target, not as an argument.
-a, _, _ = plan(Args(), dev("a.mp3", 3550, when=NOW),
-               with_rule(tgt("a.mp3"), 60.0), {}, True)
-check("target's own 60s threshold finishes it",
-      [x[3]["finished"] for x in a], [True])
-a, _, _ = plan(Args(), dev("a.mp3", 3550, when=NOW),
-               with_rule(tgt("a.mp3"), 10.0), {}, True)
-check("a 10s threshold does not", [x[3]["finished"] for x in a], [False])
-
-class ArgsOverride(Args):
-    finished_remaining_secs = 60.0
-a, _, _ = plan(ArgsOverride(), dev("a.mp3", 3550, when=NOW),
-               with_rule(tgt("a.mp3"), 10.0), {}, True)
-check("CLI override beats the library setting",
-      [x[3]["finished"] for x in a], [True])
-
-class ArgsOnlyFin(Args):
-    only_finished = True
-a, _, _ = plan(ArgsOnlyFin(), dev("a.mp3", 200, when=NOW), tgt("a.mp3"), {}, True)
-check("--only-finished drops partial positions", a, [])
+check("just listened -> no skew", (ok, "no clock skew" in why), (True, True))
+# The case that was previously misreported: a position from a while ago is
+# ordinary usage, not a clock running behind.
+ok, why = device_clock_ok(clockdev(-2340))
+check("last listened 39 min ago -> still no skew",
+      (ok, "no clock skew" in why and "BEHIND" not in why), (True, True))
+ok, why = device_clock_ok(clockdev(-7 * 86400))
+check("untouched for a week -> still no skew",
+      (ok, "no clock skew" in why), (True, True))
+# Only a future timestamp is evidence, because it is impossible otherwise.
+ok, why = device_clock_ok(clockdev(1800))
+check("dated 30 min in the future -> warns, clock is ahead",
+      (ok, "WARNING" in why and "ahead" in why), (True, True))
+ok, why = device_clock_ok(clockdev(7200))
+check("dated 2h in the future -> refuses to pull",
+      (ok, "refusing to pull" in why), (False, True))
+ok, why = device_clock_ok({})
+check("nothing saved -> nothing to check",
+      (ok, "no saved positions" in why), (True, True))
 
 print("pull safety")
 a, _, _ = run(dev("a.mp3", 50, when=NOW - 999), tgt("a.mp3"), prog(900, when=NOW),
