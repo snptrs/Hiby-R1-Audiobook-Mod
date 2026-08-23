@@ -316,6 +316,16 @@ static struct {
     int64_t track_base_ms;   /* sum durations before track_idx */
     int64_t track_pos_ms;     /* within current track */
 
+    /* Path of the file the decoder actually has open, or "" when none is.
+     * The open_track fast paths MUST key off this, not off track_idx: that is
+     * an index into the CURRENT book's array, so it says nothing about which
+     * book the open file came from. Two different books both playing their
+     * track 0 compare equal, and the fast path then "re-seeks" a file
+     * belonging to the previous book. Every podcast episode is a one-track
+     * book, so idx is always 0 and every episode switch hit that. Comparing
+     * the path is immune to track_id reuse across a rescan. */
+    char open_path[512];
+
     mp3dec_ex_t dec;        /* minimp3_ex streaming decoder (open while a track is loaded) */
     mp3dec_io_t io;         /* read/seek callbacks wired to track_fd */
     int dec_open;           /* dec is open for the current track (MP3 path) */
@@ -949,15 +959,22 @@ int player_add_bookmark(sqlite3 *db, const char *label) {
 
 /* ---- minimp3_ex / ALSA helpers ----------------------------------------- */
 
+/* Closes whatever is actually open, both formats, rather than branching on
+ * dec_fmt. book_is_playable() reassigns dec_fmt to the NEW item's format before
+ * cmd_play calls open_track, so by the time close_mh runs dec_fmt no longer
+ * describes what is open: switching an MP3 item -> an M4A one used to close the
+ * (already-closed) AAC side and leak the MP3 decoder plus its fd, and the
+ * reverse leaked the mp4 fd and the aac handle. Each of the calls below is
+ * individually guarded and mp4_audio_close is idempotent, so closing both sides
+ * unconditionally is safe and cheap. */
 static void close_mh(void) {
-    if (g_pl.dec_fmt == DEC_AAC) {
-        if (g_pl.aac) { x_aac_Close(g_pl.aac); g_pl.aac = NULL; }
-        mp4_audio_close(&g_pl.mp4);
-    } else {
-        if (g_pl.dec_open) { mp3dec_ex_close(&g_pl.dec); g_pl.dec_open = 0; }
-        if (g_pl.track_fd >= 0) { close(g_pl.track_fd); g_pl.track_fd = -1; }
-    }
+    if (g_pl.aac) { x_aac_Close(g_pl.aac); g_pl.aac = NULL; }
+    mp4_audio_close(&g_pl.mp4);
+    if (g_pl.dec_open) { mp3dec_ex_close(&g_pl.dec); g_pl.dec_open = 0; }
+    if (g_pl.track_fd >= 0) { close(g_pl.track_fd); g_pl.track_fd = -1; }
     g_pl.track_open = 0;
+    /* Nothing is open, so no path can match the fast-path check. */
+    g_pl.open_path[0] = '\0';
 }
 static void close_pcm(void) {
     if (g_pl.pcm) { x_snd_pcm_drop(g_pl.pcm); x_snd_pcm_close(g_pl.pcm); g_pl.pcm = NULL; }
@@ -1391,8 +1408,10 @@ static int open_track_aac(int idx, int64_t seek_ms) {
     g_pl.media_missing = 0;
     /* Fast path: same track already demuxed -> reset the decoder + re-seek.
      * (Re-seeking fdk-aac internally is fiddly; reopening the handle is cheap
-     * and keeps the moov parsed in g_pl.mp4, so no ~3MB moov re-read.) */
-    if (g_pl.track_open && g_pl.aac && g_pl.track_idx == idx) {
+     * and keeps the moov parsed in g_pl.mp4, so no ~3MB moov re-read.)
+     * Keyed on the open FILE, not track_idx (see open_path). */
+    if (g_pl.track_open && g_pl.aac && g_pl.track_idx == idx
+        && strcmp(g_pl.open_path, g_pl.tracks[idx].path) == 0) {
         x_aac_Close(g_pl.aac);
         g_pl.aac = x_aac_Open(AAC_TT_MP4_RAW, 1);
         if (!g_pl.aac) { plog("aac reopen failed"); close_mh(); return -1; }
@@ -1475,6 +1494,8 @@ static int open_track_aac(int idx, int64_t seek_ms) {
     g_pl.aac_need_intr = 1;  /* fresh decoder: first real decode signals restart */
     g_pl.track_open = 1;
     g_pl.track_idx = idx;
+    snprintf(g_pl.open_path, sizeof(g_pl.open_path), "%s",
+             g_pl.tracks[idx].path);
     g_pl.track_pos_ms = seek_ms;
     int64_t base = 0;
     for (int i = 0; i < idx; i++) base += g_pl.tracks[i].duration_ms;
@@ -1494,8 +1515,10 @@ static int open_track(int idx, int64_t seek_ms) {
     g_pl.media_io_error = 0;
     g_pl.media_missing = 0;
     /* Fast path: same track already open -> just re-seek the live decoder.
-     * Byte-level seek (SEEK_TO_BYTE): no frame index, instant, ~0 memory. */
-    if (g_pl.dec_open && g_pl.track_fd >= 0 && g_pl.track_idx == idx) {
+     * Byte-level seek (SEEK_TO_BYTE): no frame index, instant, ~0 memory.
+     * Keyed on the open FILE, not track_idx (see open_path). */
+    if (g_pl.dec_open && g_pl.track_fd >= 0 && g_pl.track_idx == idx
+        && strcmp(g_pl.open_path, g_pl.tracks[idx].path) == 0) {
         uint64_t target = seek_byte_target(seek_ms);
         int sr = mp3dec_ex_seek(&g_pl.dec, target);
         /* On Bluetooth, drop+prepare is NOT enough: after a pause the bluealsa
@@ -1566,6 +1589,8 @@ static int open_track(int idx, int64_t seek_ms) {
              (g_pl.dec.samples > 0 ? "vbr-tag" : "bitrate"), sr);
     }
     g_pl.track_idx = idx;
+    snprintf(g_pl.open_path, sizeof(g_pl.open_path), "%s",
+             g_pl.tracks[idx].path);
     g_pl.track_pos_ms = seek_ms;
     int64_t base = 0;
     for (int i = 0; i < idx; i++) base += g_pl.tracks[i].duration_ms;
