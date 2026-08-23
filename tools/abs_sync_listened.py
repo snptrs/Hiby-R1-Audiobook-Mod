@@ -489,14 +489,28 @@ def reconcile(device: dict[str, dict], targets: dict[str, dict],
             dev_secs, dur, item_secs, finished_frac, item_pct)))
         abs_fin = bool(cur and cur.get("isFinished"))
 
-        # Decide which side is authoritative: the more recent save wins.
         if pos is None and cur is None:
             continue
         if materially_same(dev_secs, dev_fin, abs_secs, abs_fin):
             continue
-        if pos is None:
+
+        # Discount a sub-floor unfinished position as a stray tap rather than a
+        # listening position, and do it BEFORE choosing a winner. Applying the
+        # floor later (inside the push branch, after the rewind guard) meant a
+        # 2-second tap counted as real device state, lost the rewind check
+        # against a genuine ABS position, and deadlocked there permanently.
+        # Discounting it makes the other side the source, so the stray value
+        # gets overwritten instead of blocking forever.
+        dev_meaningful = bool(pos) and (dev_fin or dev_secs >= min_position_s)
+        abs_meaningful = bool(cur) and (abs_fin or abs_secs >= min_position_s)
+
+        # Decide which side is authoritative: the more recent save wins, but
+        # only among sides that hold something worth syncing.
+        if not dev_meaningful and not abs_meaningful:
+            continue
+        if not dev_meaningful:
             newer = "abs"
-        elif cur is None:
+        elif not abs_meaningful:
             newer = "device"
         else:
             newer = "device" if dev_when > abs_when else "abs"
@@ -520,8 +534,6 @@ def reconcile(device: dict[str, dict], targets: dict[str, dict],
                     continue
                 body["isFinished"] = True
             else:
-                if dev_secs < min_position_s:
-                    continue
                 body["currentTime"] = round(dev_secs, 3)
                 if dur:
                     body["duration"] = dur
@@ -541,8 +553,6 @@ def reconcile(device: dict[str, dict], targets: dict[str, dict],
                 skipped.append(
                     f"{dev['rel']}: ABS {abs_secs:.0f}s is behind device "
                     f"{dev_secs:.0f}s, not rewinding the device")
-                continue
-            if not abs_fin and abs_secs < min_position_s:
                 continue
             # A finished ABS item reports currentTime 0, so write elapsed 0 and
             # let the completed flag stand: the player restarts a finished item

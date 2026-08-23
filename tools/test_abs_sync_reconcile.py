@@ -87,13 +87,31 @@ a, _, _ = run(dev("a.mp3", 50, when=NOW - 9), tgt("a.mp3"), prog(900, when=NOW),
 check("direction=push suppresses a pull", a, [])
 
 print("no-regression guard, both ways")
-a, _, s = run(dev("a.mp3", 19, when=NOW), tgt("a.mp3"), prog(1096, when=NOW - 999))
+# Both sides hold a real position (above the floor), so this is the deliberate
+# -restart case: the newer side is genuinely behind and must not win.
+a, _, s = run(dev("a.mp3", 100, when=NOW), tgt("a.mp3"), prog(1096, when=NOW - 999))
 check("device behind ABS does not rewind ABS", a, [])
 check("  and says why", "not rewinding ABS" in s[0], True)
 
-a, _, s = run(dev("a.mp3", 1096, when=NOW - 999), tgt("a.mp3"), prog(19, when=NOW))
+a, _, s = run(dev("a.mp3", 1096, when=NOW - 999), tgt("a.mp3"), prog(100, when=NOW))
 check("ABS behind device does not rewind device", a, [])
 check("  and says why", "not rewinding the device" in s[0], True)
+
+print("a stray tap is discounted, not deadlocked")
+# The real-world case: a 2s tap on the device against a genuine ABS position.
+# Previously the rewind guard fired first and the item was stuck for good.
+a, _, s = run(dev("a.mp3", 2, when=NOW), tgt("a.mp3"), prog(2502, when=NOW - 999))
+check("sub-floor device position lets ABS win",
+      [(x[0], x[3]["book_elapsed_ms"]) for x in a], [("pull", 2502_000)])
+check("  and does not log a standoff", s, [])
+
+a, _, s = run(dev("a.mp3", 2502, when=NOW - 999), tgt("a.mp3"), prog(2, when=NOW))
+check("sub-floor ABS position lets the device win",
+      [(x[0], round(x[3]["body"]["currentTime"])) for x in a], [("push", 2502)])
+check("  and does not log a standoff", s, [])
+
+a, _, _ = run(dev("a.mp3", 2, when=NOW), tgt("a.mp3"), prog(3, when=NOW - 9))
+check("both sides sub-floor does nothing", a, [])
 
 # Above the minimum-position floor, so this exercises the rewind guard alone.
 a, _, _ = run(dev("a.mp3", 100, when=NOW), tgt("a.mp3"), prog(1096, when=NOW - 9),

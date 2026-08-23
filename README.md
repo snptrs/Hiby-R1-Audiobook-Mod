@@ -159,8 +159,9 @@ Behaviours worth knowing:
   duration so short episodes
   are not called finished too early.
 - **A few seconds of playback is not a position.** An unfinished position below
-  30s is ignored on both sides, so a stray tap does not become a Continue
-  Listening entry. Tune with `--min-position-secs`; finishing is always synced.
+  30s is discounted on both sides, so a stray tap neither becomes a Continue
+  Listening entry nor blocks the other side from winning: the real position
+  overwrites it. Tune with `--min-position-secs`; finishing is always synced.
 - **Pulling refuses to run if a saved position is dated in the future.**
   Ordering depends on the `.pos` timestamps, and a device clock running ahead
   would let stale card state beat a newer ABS change. Only that direction is
