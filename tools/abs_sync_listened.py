@@ -261,7 +261,7 @@ class Abs:
         """
         return self._req("PATCH", path, body)
 
-    def episodes(self, library_id: str) -> dict[str, dict]:
+    def episodes(self, library_id: str, rule=(None, None)) -> dict[str, dict]:
         """Podcast episodes, keyed to match the card's layout.
 
         item.relPath is the show folder relative to the ABS library root and
@@ -284,10 +284,11 @@ class Abs:
                     "rel": key, "kind": KIND_PODCAST,
                     "library_item_id": ep.get("libraryItemId") or stub["id"],
                     "episode_id": ep["id"], "duration": af.get("duration"),
+                    "finished_secs": rule[0], "finished_pct": rule[1],
                 }
         return out
 
-    def books(self, library_id: str) -> dict[str, dict]:
+    def books(self, library_id: str, rule=(None, None)) -> dict[str, dict]:
         """Audiobooks, keyed on the item folder (its relPath)."""
         out: dict[str, dict] = {}
         for stub in self.get(f"/libraries/{library_id}/items?limit=2000"
@@ -303,6 +304,7 @@ class Abs:
                 "rel": rel, "kind": KIND_BOOK,
                 "library_item_id": stub["id"], "episode_id": None,
                 "duration": dur,
+                "finished_secs": rule[0], "finished_pct": rule[1],
             }
         return out
 
@@ -431,8 +433,15 @@ def reconcile(device: dict[str, dict], targets: dict[str, dict],
         abs_when = ((cur.get("lastUpdate") or 0) / 1000.0) if cur else None
         dur = tgt.get("duration")
 
+        # Each library configures its own markAsFinishedTimeRemaining (yours
+        # are 10s for podcasts, 30s for audiobooks), so use the one belonging
+        # to this item unless the CLI overrode it.
+        item_secs = (finished_secs if finished_secs is not None
+                     else tgt.get("finished_secs"))
+        item_pct = (finished_pct if finished_pct is not None
+                    else tgt.get("finished_pct"))
         dev_fin = bool(pos and (pos["completed"] or near_end(
-            dev_secs, dur, finished_secs, finished_frac, finished_pct)))
+            dev_secs, dur, item_secs, finished_frac, item_pct)))
         abs_fin = bool(cur and cur.get("isFinished"))
 
         # Decide which side is authoritative: the more recent save wins.
@@ -529,14 +538,19 @@ def device_clock_ok(device: dict[str, dict]) -> tuple[bool, str]:
     if skew > CLOCK_SKEW_TOLERANCE_S:
         return False, (f"device clock is {skew / 3600:.1f}h AHEAD of this Mac; "
                        f"refusing to pull, positions cannot be ordered")
-    if skew > CLOCK_WARN_AHEAD_S:
+    if abs(skew) <= CLOCK_WARN_AHEAD_S:
+        return True, f"device clock within {abs(skew) / 60:.0f} min of this Mac"
+    # Beyond the warn threshold, always name the direction. Reporting a bare
+    # "within 35 min" reads like a pass and hides which way it leans, which is
+    # the whole reason for reporting it.
+    if skew > 0:
         return True, (f"WARNING device clock is ~{skew / 60:.0f} min AHEAD of "
                       f"this Mac, so a device position can wrongly beat an ABS "
-                      f"change made in that window. Set the R1's clock.")
-    if skew < -CLOCK_SKEW_TOLERANCE_S:
-        return True, (f"device clock is {-skew / 3600:.1f}h behind this Mac "
-                      f"(biases toward ABS; less harmful, still worth fixing)")
-    return True, f"device clock within {abs(skew) / 60:.0f} min of this Mac"
+                      f"change made inside that window. Set the R1's clock.")
+    return True, (f"WARNING device clock is ~{-skew / 60:.0f} min BEHIND this "
+                  f"Mac, so real device listening can lose to older ABS state. "
+                  f"Less harmful than running ahead (the no-rewind guard "
+                  f"catches the common case) but set the R1's clock.")
 
 
 def run_check(args) -> int:
@@ -680,30 +694,37 @@ def main() -> int:
             log(f"clock: {why}")
 
     abs_ = Abs(args.abs_url, token)
-    abs_secs, abs_pct = abs_.finished_rule(args.library_id)
-    finished_secs = (args.finished_remaining_secs
-                     if args.finished_remaining_secs is not None else abs_secs)
-    src = ("--finished-remaining-secs"
-           if args.finished_remaining_secs is not None
-           else "ABS markAsFinishedTimeRemaining")
-    if finished_secs:
-        log(f"finished when <= {finished_secs:g}s remain (capped at "
-            f"{args.finished_remaining_frac:g} of duration) [from {src}]")
-    elif abs_pct:
-        log(f"finished at >= {abs_pct:g} complete [from ABS]")
+    pod_rule = abs_.finished_rule(args.library_id)
+    book_rule = (abs_.finished_rule(args.book_library_id)
+                 if args.book_library_id else (None, None))
+    if args.finished_remaining_secs is not None:
+        log(f"finished when <= {args.finished_remaining_secs:g}s remain, all "
+            f"libraries [from --finished-remaining-secs]")
     else:
-        log("no finished threshold configured: requires true end-of-file")
+        def describe(name, rule):
+            secs, pct = rule
+            if secs:
+                return f"{name}: <= {secs:g}s remaining"
+            if pct:
+                return f"{name}: >= {pct:g} complete"
+            return f"{name}: true end-of-file only"
+        parts = [describe("podcasts", pod_rule)]
+        if args.book_library_id:
+            parts.append(describe("audiobooks", book_rule))
+        log("finished thresholds [each library's own setting] "
+            + "; ".join(parts)
+            + f" (capped at {args.finished_remaining_frac:g} of duration)")
 
-    targets = abs_.episodes(args.library_id)
+    targets = abs_.episodes(args.library_id, pod_rule)
     if args.book_library_id:
-        targets.update(abs_.books(args.book_library_id))
+        targets.update(abs_.books(args.book_library_id, book_rule))
     log(f"items known to ABS: {len(targets)}")
     prog = abs_.progress()
 
     actions, unmatched, skipped = reconcile(
         device, targets, prog, direction=args.direction,
         finished_secs=finished_secs, finished_frac=args.finished_remaining_frac,
-        finished_pct=abs_pct, allow_rewind=args.allow_rewind,
+        finished_pct=None, allow_rewind=args.allow_rewind,
         can_pull=can_pull, min_position_s=args.min_position_secs)
 
     if args.only_finished:

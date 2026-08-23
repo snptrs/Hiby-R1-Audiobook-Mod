@@ -151,7 +151,14 @@ ok, why = device_clock_ok(clockdev(7200))
 check("2h ahead -> refuses to pull", (ok, "refusing to pull" in why), (False, True))
 ok, why = device_clock_ok(clockdev(-7200))
 check("2h behind -> allowed, names the direction",
-      (ok, "behind" in why), (True, True))
+      (ok, "behind" in why.lower()), (True, True))
+# The real-world case that was previously reported as a bland "within 35 min",
+# which read like a pass and hid the direction entirely.
+ok, why = device_clock_ok(clockdev(-2100))
+check("35 min behind -> warns and names the direction",
+      (ok, "WARNING" in why and "behind" in why.lower()), (True, True))
+ok, why = device_clock_ok(clockdev(-60))
+check("1 min out -> quiet pass", (ok, "WARNING" in why), (True, False))
 
 print("pull safety")
 a, _, _ = run(dev("a.mp3", 50, when=NOW - 999), tgt("a.mp3"), prog(900, when=NOW),
