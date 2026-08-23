@@ -2,6 +2,134 @@
 
 All public releases are for the normal HiBy R1 on stock firmware 1.6. Do not install these packages on the R1 MIDI.
 
+## Unreleased - podcast support
+
+Not built or flashed yet: no version marker, package name, or hashes assigned.
+Host tests pass (`tools/test_host_library_scan.sh`); the UI and player changes
+are typecheck-only so far and still need the Windows/Zig build and on-device
+verification.
+
+### Added: podcasts as first-class entries
+
+- New sibling SD root `/Podcasts`, scanned alongside `/Audiobooks`. Files are
+  copied to the card exactly as audiobooks are; nothing is downloaded on the
+  device.
+- Each podcast audio **file** becomes its own library row rather than a track
+  of one show-sized book. `progress` is keyed `book_id PRIMARY KEY`, so a row
+  per episode is what gives each episode its own resume position, its own
+  played state, and its own Continue entry.
+- A show is a `series` row named by its path relative to `/Podcasts`, so two
+  shows can each hold a `2024` subfolder without merging into one show
+  (`series.display_name` is UNIQUE).
+- Episode order is the reverse of the scanner's natural filename sort, stored
+  in `series_number`. Newest-first for date-prefixed or numbered filenames;
+  reverse-alphabetical otherwise. Tag dates are not read.
+- Home replaces **Series** with **Podcasts** (shows, then episodes). Home has
+  eight fixed 78 px rows and does not scroll, so a ninth would have collided
+  with the refresh flash and the footer. The Series queries remain in the code,
+  just unreachable from Home.
+- Podcast episodes are excluded from Titles, Authors, Folders and Finished via
+  a new `books.kind` column, and included in Continue.
+- Chapters buttons on Detail and Now Playing are hidden for items with no
+  chapters, rather than leading to an empty "No chapters" screen. Real embedded
+  chapters in an episode are still parsed and shown; none are synthesized.
+- `/Podcasts` is hidden from HiBy's stock Music catalog on app entry, the same
+  way `/Audiobooks` has been since v2.0.28.
+
+### Fixed: starting a new item kept playing the previous one
+
+Reported on-device: starting a podcast episode while another was playing
+carried on playing the first episode. Pre-existing, and it affects audiobooks
+too, but podcasts made it near-certain.
+
+- Both `open_track` fast paths (MP3 `player.c`, AAC `open_track_aac`) decided
+  "this track is already open" from `g_pl.track_idx == idx` alone. That index is
+  into the **current book's** track array, so it says nothing about which book
+  the open file belongs to. Switching items then took the fast path and merely
+  re-seeked the file already open, while using the new track's duration for the
+  position maths.
+- Every podcast episode is a one-track book, so `idx` is always 0 and
+  `track_idx` is always 0: every episode switch hit it. On the audiobook side it
+  needs a switch from book A's track N to book B's track N, which starting a new
+  book while another plays its first track satisfies.
+- Both fast paths now also require the open file's path to match. A new
+  `g_pl.open_path` records what the decoder actually has open, is set where a
+  track is really opened, and is cleared in `close_mh`. Comparing paths rather
+  than `track_id` keeps this correct across a rescan, which can reuse ids.
+
+### Fixed: switching between MP3 and M4A items leaked an fd each time
+
+Found while fixing the above, same code path. `book_is_playable` assigns
+`g_pl.dec_fmt` for the **new** item before `cmd_play` calls `open_track`, but
+`close_mh` branched on `dec_fmt` to decide what to close. So an MP3 item
+followed by an M4A one closed the already-closed AAC side and leaked the MP3
+decoder plus its file descriptor; the reverse leaked the mp4 fd and the aac
+handle. `close_mh` now closes both sides unconditionally, which is safe because
+every call is individually guarded and `mp4_audio_close` is idempotent. Mixed
+MP3/M4A show folders make this easy to hit.
+
+### Fixed: a finish was erased on every app exit
+
+- `CMD_QUIT` saved progress with a hardcoded `completed = 0`. The guards that
+  stop pause and stop from clobbering a finish do not apply on that path, so
+  leaving the app un-finished whatever had just been completed, and
+  Continue Listening re-listed it at ~100% with a fresh timestamp. The quit
+  save now carries the current completed state through.
+- Nothing ever wrote `books.completed`, but the "Done" badge and the Finished
+  list both read it, so neither could ever appear. Both now read
+  `progress.completed`. Combined with the fix above, Finished and the badge
+  work for the first time; nothing appears retroactively, because the quit bug
+  had been erasing the flag all along.
+- Replaying a finished item resumed 5 seconds before the end and immediately
+  finished again. It now restarts from the beginning. The completed flag was
+  already being loaded and discarded.
+
+### Fixed: scanner issues surfaced by adding a second root
+
+- Orphan cleanup is now scoped to the roots that actually scanned, and runs
+  once after all roots instead of once per root. Previously the only thing
+  preventing mass deletion when a root was missing was the incidental early
+  return from the single-root scan. With two roots, a renamed or unmounted
+  `/Audiobooks` alongside a present `/Podcasts` would have deleted every
+  audiobook row and, with it, the `.pos` and bookmark sidecars that hold the
+  authoritative resume positions.
+- New cleanup pass removes books left with no tracks. Needed because an
+  episode's `root_path` is its show folder, which survives deleting the episode
+  file, so the row would otherwise linger forever.
+- `derive_path_metadata` takes the active root instead of hardcoding
+  `/Audiobooks`. A path outside that root previously kept its full absolute
+  path, deriving an empty author and a junk series literally named `usr`.
+- The embedded-cover cache directory is now per-root rather than always under
+  `/Audiobooks`, and a show's cover is extracted once and shared by all its
+  episodes so the on-SD `.r565` cache is not duplicated per episode.
+- Episode `book_key`s carry a hash of the full file path.
+  `audiobook_derive_book_key` collapses spaces, dots, dashes and underscores to
+  a single `_`, so per-file keys collided readily (`Ep 1.mp3`, `Ep-1.mp3` and
+  `Ep.1.mp3` all produced the same key) and a collision silently dropped an
+  episode while corrupting the survivor's title and duration.
+- Episode titles strip only the file extension. `clean_book_title` strips a
+  leading four-digit year, which would have turned `2026-08-01 Interview.mp3`
+  into `08-01 Interview` and destroyed exactly the part that makes
+  date-prefixed episodes sort correctly.
+- Fixed a ~786 KB leak per skipped book directory: three early-exit paths in
+  the per-book loop bypassed the `free` of the file list.
+- `VACUUM` runs once per refresh instead of once per root.
+
+### Testing
+
+- `tools/test_host_library_scan.sh` builds the library and scanner layers with
+  clang and runs them against a synthetic tree: schema migration and repeated
+  opens, kind filtering, orphan-cleanup scoping, the zero-track pass, the
+  book_key collision case, show-name merging, date-prefix preservation, and an
+  audiobook-grouping regression check.
+- `tools/hostshim/` provides stub `linux/input.h` and `linux/fb.h` so `ui.c`,
+  `hook.c`, `render.c` and `player.c` can be typechecked with `-Wall -Wextra`
+  on a host. The shipped build passes no warning flags, and several `switch`
+  statements over `list_mode_t` fail silently at runtime when a case is
+  missing, so this is the only diagnostic available for them.
+- `tools/build_r1_audiobook_library.ps1` builds again; it was missing
+  `bookmark_sd.c` and the two symbols now stubbed in `library_test_stubs.c`.
+
 ## v2.0.28 - 2026-08-09
 
 Firmware marker: `2.0.28` - About-screen label `HiBy R1 2.0.28`.
@@ -601,31 +729,31 @@ through ALSA, launched from the launcher's Audiobooks tile via an `LD_PRELOAD`
 hook into `hiby_player`.
 
 - New dedicated Audiobooks app with Home, Titles/Authors/Series/Folders/Finished
- lists, book detail, Now Playing, Chapters, and Bookmarks screens - all drawn
- by the app, not repurposed stock music views.
+  lists, book detail, Now Playing, Chapters, and Bookmarks screens - all drawn
+  by the app, not repurposed stock music views.
 - MP3 and M4B/AAC playback (AAC via `dlopen`'d `libfdk-aac`; self-contained
- `mp4_audio.c` demuxer).
+  `mp4_audio.c` demuxer).
 - Per-book and multipart resume across reboots and book switching, with a
- 5-second smart rewind on resume from a saved position.
+  5-second smart rewind on resume from a saved position.
 - Now Playing: cover art, title/author/duration, and a draggable progress
- handle for scrub-seek (tapping the bar elsewhere does not jump).
+  handle for scrub-seek (tapping the bar elsewhere does not jump).
 - Playback speed 1.0 / 1.1 / 1.25 / 1.5x via WSOLA time-stretch (pitch
- preserved; 1.0x exact passthrough). Persists via `playback_speed`.
+  preserved; 1.0x exact passthrough). Persists via `playback_speed`.
 - Sleep timer Off / 15 / 30 / 60 min with live on-screen countdown; auto-pauses
- and saves position on expiry.
+  and saves position on expiry.
 - M4B embedded chapters parsed from the QuickTime chapter track (stsc-aware, so
- multi-sample chunks resolve correctly) or Nero `chpl`; MP3 books get one
- synthesized chapter per file. Chapters cached at scan time (Home -> Refresh).
+  multi-sample chunks resolve correctly) or Nero `chpl`; MP3 books get one
+  synthesized chapter per file. Chapters cached at scan time (Home -> Refresh).
 - Bookmarks: tap Mark on Now Playing to add; tap to jump; long-press to delete.
 - Cover-art thumbnails in lists (libjpeg decode-on-demand, progressive-JPEG
- guard to avoid OOM freezes; pre-warm starvation fix so one bad cover doesn't
- block the rest).
+  guard to avoid OOM freezes; pre-warm starvation fix so one bad cover doesn't
+  block the rest).
 - Hardware controls: power toggles backlight (audio plays dark, double-tap
- wakes), play/pause/prev/next/volume in-app, fine-stepped volume (~2-2.5 dB)
- with hold-to-ramp, Back always top-left.
+  wakes), play/pause/prev/next/volume in-app, fine-stepped volume (~2-2.5 dB)
+  with hold-to-ramp, Back always top-left.
 - Swipe left from a list jumps to Now Playing.
 - Library, progress, chapters, and bookmarks in an on-device SQLite DB; the
- stock music database is no longer involved.
+  stock music database is no longer involved.
 - Clean exit to the HiBy launcher (no black screen, no power-button kick).
 
 **Expected behavior:** open Audiobooks and tap Home -> Refresh on first run
@@ -645,7 +773,7 @@ Built package `r1-audiobooks-2.0A.upt`.
 - Rootfs MD5: `6baf5dcaae7d00fdded6b8cac62f485a`
 - Rootfs SHA256: `edae5ba040741e0a522f8192b969858232ce0f54af9ccb0cc9a042242a02eec4`
 - `hiby_player.audiobooks` (supervisor shell) MD5 inside rootfs:
- `cbe2bc1001cbe6ad6ce6cd8e04889c59`
+  `cbe2bc1001cbe6ad6ce6cd8e04889c59`
 - `libaudiobook_hook.so` size: 1,623,492 bytes
 - `r1_audiobook_app` size: 81,160 bytes
 

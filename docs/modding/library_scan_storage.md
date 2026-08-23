@@ -12,6 +12,111 @@ Source:
 [`audiobook_app/posstore.h`](../../audiobook_app/posstore.h),
 [`audiobook_app/bookmark_sd.c`](../../audiobook_app/bookmark_sd.c).
 
+## Multi-root scanning and podcasts
+
+Two roots are scanned: `AUDIOBOOK_LIBRARY_ROOT` (`/Audiobooks`) with
+`LIB_KIND_BOOK`, and `AUDIOBOOK_PODCAST_ROOT` (`/Podcasts`) with
+`LIB_KIND_PODCAST`. The table is `SCAN_ROOTS` in `scan.c`;
+`audiobook_scan_all()` walks it and is what the UI's Refresh calls.
+
+**Why an episode is a book row, not a track.** `progress` is keyed
+`book_id INTEGER PRIMARY KEY`, so a row holds exactly one resume point. A show
+represented as one book could therefore only ever remember one position across
+all its episodes. Per-episode resume requires a row per episode, which is why
+the podcast branch emits one book per FILE. This also means the whole player,
+bookmark, speed and Continue machinery works on episodes with no changes.
+
+**Constraints that shape the podcast row.** These are not stylistic:
+
+- `root_path` must stay the **show folder**, never the file.
+  `audiobook_cleanup_orphans` deletes any book whose `root_path` does not
+  `stat` as a directory, so a file path there is wiped on the next scan.
+- The show name is the folder path **relative to the podcast root**, not its
+  basename. `series.display_name` is UNIQUE, so basenames would merge
+  `/Podcasts/A/2024` and `/Podcasts/B/2024` into one show with two interleaved
+  episode-index sequences.
+- Episode `book_key` needs a path hash appended. `audiobook_derive_book_key`
+  maps space, `.`, `-`, `_` and brackets all to a single `_`, so `Ep 1.mp3`,
+  `Ep-1.mp3` and `Ep.1.mp3` sanitize identically. A collision is silently
+  destructive: the second `upsert_book` UPDATEs the first row via
+  `ON CONFLICT(book_key)`, then its track insert fails `UNIQUE(book_id,
+ordinal)` and the episode disappears while the survivor carries the wrong
+  title and duration.
+- Episode titles must not go through `clean_book_title`, which strips a leading
+  four-digit year and would turn `2026-08-01 Interview.mp3` into
+  `08-01 Interview`.
+- No chapters are synthesized. The single-file fallback would give every
+  episode one meaningless "Chapter 1"; real embedded chapters are still parsed.
+
+**Ordering** is `series_number` DESC, where `series_number` is the episode's
+index in the natural filename sort `collect_audio_files` already applies. This
+is reverse _filename_ order, which equals newest-first only for date-prefixed
+or numbered names. `date_modified` is not a usable alternative: it is written
+only on INSERT and never updated on re-scan, and a bulk copy to exFAT stamps
+every file with the same time. Reading a real date needs a new field in
+`audio_tags_t` (ID3 `TDRC`/`TYER`, MP4 `©day`).
+
+### Orphan cleanup scoping is a data-loss guard
+
+`audiobook_cleanup_orphans_scoped()` only considers books under the roots
+passed in, and `audiobook_scan_all()` passes only the roots that actually
+scanned. Deleting a book also calls `pos_remove_sd()` and
+`bookmark_remove_book_sd()`, and those SD sidecars are the **authoritative**
+copies of resume positions and bookmarks, so a wrong deletion here is
+unrecoverable.
+
+Before the second root existed, the only thing preventing mass deletion was an
+accident of ordering: the single-root scan returned early when its root failed
+to `stat`, before reaching cleanup. Once missing roots are skipped rather than
+fatal, that protection is gone. A renamed `/Audiobooks` next to a present
+`/Podcasts` would otherwise fail every audiobook's `S_ISDIR` test at once.
+
+The tradeoff is deliberate and worth knowing: rows under a root can only ever
+be cleaned **while that root exists**. Delete `/Podcasts` outright and its
+episode rows persist indefinitely, still listed under Podcasts and unplayable;
+recreating an empty `/Podcasts` is what clears them, because the root then
+resolves and every show folder underneath fails its `S_ISDIR` test. Ghost rows
+that one refresh fixes are the right side of this trade against silently
+destroying resume data, but it does mean "delete the folder" is not the way to
+remove a library.
+
+Cleanup therefore runs **once, after all roots**, in its own transaction, not
+per root. Per-root cleanup would run the zero-track pass before the other
+root's tracks had been upserted. It cannot share one transaction with the
+scans either: `g_db_write_lock` is a plain `PTHREAD_MUTEX_INITIALIZER` and so
+non-recursive, and holding it across both scans starves the player thread's
+progress saves for the whole refresh.
+
+The **zero-track pass** exists because an episode's `root_path` is its show
+folder, which survives deleting the episode file: the dead-track pass removes
+the track and the book row would otherwise linger forever. It runs after the
+dead-track pass and only for books whose `root_path` still stats, so a
+transient SD read failure cannot cascade into destroying sidecars. `book_id`
+is a rowid and gets reused, so a stale `<id>.pos` could otherwise later attach
+to an unrelated episode.
+
+### The `books.kind` column
+
+`0` = audiobook, `1` = podcast episode. Added by `MIGRATION_SQL` in
+`library.c`, exec'd **separately from `SCHEMA_SQL` with its result ignored**.
+It must not go inside `SCHEMA_SQL`: that runs as one exec whose failure is
+fatal in `audiobook_db_open`, and `ALTER TABLE ADD COLUMN` reports "duplicate
+column name" on every run after the first, which would stop the library
+opening on the second boot.
+
+Every query feeding `fill_book_from_stmt` shares one `SQL_BOOK_COLUMNS` macro,
+with `kind` appended last at index 20. That sharing is load-bearing: a SELECT
+that omits the column does not error, because `sqlite3_column_int()` past the
+last column quietly returns 0, so a half-updated set of constants would read
+every episode as an audiobook.
+
+The ad-hoc Folders query in `ui.c` deliberately has **no** kind filter. Its
+range bounds are built from the Audiobooks root, and under BINARY collation a
+`/Podcasts/...` path cannot fall inside `[".../Audiobooks/", ".../Audiobooks0")`
+because `P` > `A`. Adding `AND b.kind=0` there would buy nothing and is exactly
+where `AND` binding tighter than `OR` would silently drop the
+books-at-this-level rows.
+
 ## Stock Music catalog isolation (v2.0.x)
 
 The native audiobook catalog and HiBy's stock Music catalog are independent.
@@ -23,8 +128,13 @@ this because a pre-2.0 maintenance build had already cleaned their stock DB.
 `music_catalog.c` fixes that boundary on every Audiobooks app entry. A
 short-lived background worker opens each existing HiBy DB location
 (`/usr/data/usrlocal_media.db`, `/data/usrlocal_media.db`, and the SD-root
-copy), deduplicates aliases by device/inode, and removes only root
-`/Audiobooks` paths in a transaction. It then reconciles the stock Music
+copy), deduplicates aliases by device/inode, and removes only paths under the
+roots the app owns in a transaction. `APP_PATH_SQL` lists them: `/Audiobooks`
+and (since podcast support) `/Podcasts`, each in the three spellings HiBy's
+scanner uses (`a:\<root>\`, `/mnt/sd_0/<root>/`,
+`/usr/data/mnt/sd_0/<root>/`). Adding a root means adding three clauses there,
+or its files leak straight back into Music after Update Database. It then
+reconciles the stock Music
 search rows, named catalog counts, format counts, total counts, and time
 indexes. Missing copies are normal. A just-finished stock scan lock is retried
 three times. There is no resident watcher and therefore no idle polling,
@@ -32,8 +142,11 @@ memory, or battery overhead.
 
 Host regression coverage is in `tools/test_music_catalog_cleanup.py` and
 `tools/test_music_catalog_cleanup.ps1`. It always runs a committed synthetic
-HiBy-schema fixture (including shared music/audiobook metadata) and also uses
-captured device DBs when available. It verifies zero audiobook leakage,
+HiBy-schema fixture (including shared music/audiobook metadata and a podcast
+episode that shares artist and album-artist with a Music row, so catalog
+reconciliation is exercised) and also uses captured device DBs when available.
+The removal predicate is generated from `APP_LIKES`, which must track
+`APP_PATH_SQL`. It verifies zero leakage from either root,
 preserves every legitimate Music row exactly, checks catalog counts and SQLite
 integrity, and verifies that a second cleanup is a no-op.
 
@@ -76,11 +189,13 @@ faulting 4 pages: ~17.5 MB (only ~2 MB drop including the probe process) →
 16 MB mmap cost ~16 KB RAM, not 16 MB.
 
 ### exFAT read-only mmap works on this kernel
+
 4.4.94+ in-tree Samsung exfat (NOT FUSE — mount opts
 `bps=512,errors=remount-ro,delayed_meta`). The exFAT/sqlite concern was about
-*locking*, not read-only mmap of a data file.
+_locking_, not read-only mmap of a data file.
 
 ### mmap offset / LFS note
+
 No `-D_FILE_OFFSET_BITS=64` in the build; `off_t` is 32-bit. Fine for this
 library — all M4B files <2 GB, moov-at-end offsets (~1.5 GB) are under the 2.1
 GB signed-32-bit limit. A future >2 GB moov-at-end file would return NULL →
@@ -124,6 +239,7 @@ Credits" (0..28474 ms), "Chapter 1" (28474..694880 ms), … "Epilogue"
 stsc `fc/spc/sdi[256]`) — no malloc, no OOM risk.
 
 ### Gotcha — chapters are DB-cached at scan time
+
 `scan.c`: `delete_chapters_for_track` then `audio_read_chapters` →
 `upsert_chapter` per chapter, all at SCAN time. Flashing the fix alone does
 NOT repair existing rows — the user must **tap Home → Refresh** to re-scan,
@@ -152,9 +268,9 @@ fallback. Tag-level unsynchronization and compressed/encrypted frames are
 rejected instead of allocating an unbounded rewrite buffer.
 
 On-device validation after Refresh: 52 books, 298 tracks, 1,150 chapter rows.
-Six single-file MP3 books exposed embedded chapters, including 23 for *Day By
-Day Armageddon* and 31 each for *Trilobyte* and *Southlands*. Tapping Chapter 2
-in *Day By Day Armageddon* issued one direct seek to 3,055,746 ms and began
+Six single-file MP3 books exposed embedded chapters, including 23 for _Day By
+Day Armageddon_ and 31 each for _Trilobyte_ and _Southlands_. Tapping Chapter 2
+in _Day By Day Armageddon_ issued one direct seek to 3,055,746 ms and began
 playback at 50:55. MP3 files without `CHAP` retain the existing fallback:
 multi-file books expose one chapter per file, while a single file exposes one
 placeholder.
@@ -220,6 +336,7 @@ position-save on SD is safe (v2.0.9+).
 ## `/usr/data` UBIFS (36 MB) chronic near-full — the root cause of "tile won't open" + "scan stalls"
 
 Why `/usr/data` (not SD) holds the DB:
+
 1. SQLite needs a real POSIX FS with byte-range locking + journal — SD is
    exFAT (known corruption risk via the FUSE exfat driver); `/usr/data` is
    UBIFS (journaled, wear-leveled, power-fail safe).
@@ -231,6 +348,7 @@ Stock HiBy music app does the same (writes `usrlocal_media.db` to BOTH
 `/usr/data` and SD).
 
 Real `/usr/data` consumers (NOT cover cache — that's dead code):
+
 - Dev cruft (one-time, won't recur in production — the production hook lives
   in read-only rootfs `/usr/lib/libaudiobook_hook.so`).
 - **Stock music DB `usrlocal_media.db` ~5.3 MB, bounded by music-library size,
@@ -245,6 +363,7 @@ back onto `/usr/data`, re-consuming the freed space. The partition is
 chronically near-full because of the recurring stock music DB.
 
 ### Gotcha — the symlink approach is DEAD
+
 Symlinked `/usr/data/usrlocal_media.db` → an SD copy worked briefly, but after
 a music scan post-reboot, `/usr/data/usrlocal_media.db` went from symlink → a
 6 MB regular file (mtime 15:45), `/usr/data` back to 1.7 MB free. The scanner
@@ -252,6 +371,7 @@ insists on a regular file (it `unlink`s + recreates on every scan, clobbering
 any symlink). Can't redirect the 6 MB DB off `/usr/data`. Abandoned.
 
 ### Guards added (v2.0.3, APP-LEVEL ONLY — no boot/PMIC/mount/binary risk)
+
 1. Pre-scan free-space guard: `statvfs(AUDIOBOOK_DATA_DIR)` at the top of
    `audiobook_scan_library`; `SCAN_MIN_FREE_BYTES = 1*1024*1024` (lowered
    from 2 MB because the stock music DB keeps `/usr/data` chronically near-full
@@ -288,6 +408,7 @@ attempts the optional DB mirror. If Refresh owns the writer lock, the mirror is
 skipped rather than blocking the decoder.
 
 ### The scan ALREADY self-cleans (scan.c)
+
 `upsert_book`/`upsert_track` use `INSERT ... ON CONFLICT(book_key) DO UPDATE`
 (re-scan overwrites, no duplication); `audiobook_cleanup_orphans()` runs at the
 end of every scan, stats every book's `root_path` + every track's `path`,
