@@ -123,11 +123,11 @@ sync; this script only ever writes `.pos` files, never media.
 
 `--direction` selects what it does:
 
-| | |
-|---|---|
+|        |                                                    |
+| ------ | -------------------------------------------------- |
 | `push` | device to ABS. Read-only with respect to the card. |
-| `pull` | ABS to device. **Writes `.pos` files.** |
-| `both` | two-way. What the wrapper uses. |
+| `pull` | ABS to device. **Writes `.pos` files.**            |
+| `both` | two-way. What the wrapper uses.                    |
 
 Podcasts are always included. Audiobooks are included when
 `--book-library-id` is given; the wrapper sets it.
@@ -144,12 +144,13 @@ Behaviours worth knowing:
 - **Near-end counts as finished, using the ABS library's own setting.** The
   firmware only sets `completed` when the decoder runs off the true end of a
   file, so stopping during a podcast outro would leave an item unfinished
-  forever. The threshold defaults to the library's
-  `markAsFinishedTimeRemaining`, so ABS stays the one place it is configured.
-  ABS does not apply that setting to progress pushed over its API (verified: at
-  30s remaining a write stays unfinished even with the setting at 10s, because
-  the rule runs on ABS's own playback sessions), so the script reads the number
-  and applies it. It caps the allowance at 10% of duration so short episodes
+  forever. Each library's own `markAsFinishedTimeRemaining` is used for its own
+  items, so ABS stays the one place it is configured and podcasts and
+  audiobooks can differ. ABS does not apply that setting to progress pushed
+  over its API (verified: at 30s remaining a write stays unfinished even with
+  the setting at 10s, because the rule runs on ABS's own playback sessions), so
+  the script reads the number and applies it. It caps the allowance at 10% of
+  duration so short episodes
   are not called finished too early.
 - **A few seconds of playback is not a position.** An unfinished position below
   30s is ignored on both sides, so a stray tap does not become a Continue
