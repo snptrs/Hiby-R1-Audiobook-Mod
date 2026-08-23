@@ -573,11 +573,19 @@ def require_stock_modes(
         print(f"OK   stock symlink targets match rebuilt rootfs for {link_count} links")
 
 
+# unsquashfs -lls resolves uid/gid against the HOST's user database, so the same
+# root-owned image prints differently per platform: "0/0" on Windows (no
+# database to resolve against), "root/root" on Linux, "root/wheel" on macOS
+# (where gid 0 is named wheel). All three mean uid 0 / gid 0. Anything else is
+# still a real failure.
+ROOT_OWNER_FORMS = frozenset({"0/0", "root/root", "root/wheel", "root/0", "0/root"})
+
+
 def require_all_root_owned(entries: dict[str, SquashfsEntry], failures: list[str]) -> None:
     non_root = [
         (path, entry.owner)
         for path, entry in sorted(entries.items())
-        if entry.owner != "0/0"
+        if entry.owner not in ROOT_OWNER_FORMS
     ]
     if non_root:
         print("FAIL rebuilt rootfs entries are root-owned")
