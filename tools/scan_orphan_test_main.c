@@ -131,6 +131,32 @@ int main(int argc, char **argv) {
     sqlite3_finalize(st);
     CHECK(victim_id > 0 && victim[0], "picked an episode to delete");
 
+    /* Give it a progress row first. Without one the delete path is trivially
+     * clean; WITH one, progress.track_id references the track with no ON DELETE
+     * action, so the track delete fails on a FOREIGN KEY violation. That is the
+     * real-world case (anything you have played) and it left the item visible
+     * in the UI forever. */
+    {
+        audiobook_progress_t pr;
+        memset(&pr, 0, sizeof(pr));
+        pr.book_id = victim_id;
+        pr.track_ordinal = 1;
+        pr.position_ms = 1234;
+        pr.total_book_elapsed_ms = 1234;
+        pr.playback_speed = 1.0;
+        pr.last_played_at = 1;
+        sqlite3_stmt *ts = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT track_id FROM tracks WHERE book_id=?",
+                               -1, &ts, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(ts, 1, victim_id);
+            if (sqlite3_step(ts) == SQLITE_ROW)
+                pr.track_id = sqlite3_column_int(ts, 0);
+            sqlite3_finalize(ts);
+        }
+        CHECK(audiobook_save_progress(db, &pr) == 0,
+              "gave the victim a progress row (the case that used to wedge)");
+    }
+
     if (remove(victim) != 0) { printf("FAIL: could not delete %s\n", victim); return 1; }
     printf("   deleted file: %s\n", victim);
 
@@ -149,6 +175,12 @@ int main(int argc, char **argv) {
         "SELECT COUNT(*) FROM books b WHERE NOT EXISTS "
         "(SELECT 1 FROM tracks t WHERE t.book_id=b.book_id)") == 0,
         "no book rows left without tracks");
+    snprintf(q, sizeof(q),
+             "SELECT COUNT(*) FROM tracks WHERE book_id=%d", victim_id);
+    CHECK(scalar(db, q) == 0, "its track row is gone (the FK no longer blocks)");
+    snprintf(q, sizeof(q),
+             "SELECT COUNT(*) FROM progress WHERE book_id=%d", victim_id);
+    CHECK(scalar(db, q) == 0, "its progress row cascaded away");
 
     audiobook_db_close(db);
     printf(fail ? "\nRESULT: FAIL\n" : "\nRESULT: PASS\n");

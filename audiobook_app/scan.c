@@ -1355,12 +1355,32 @@ int audiobook_cleanup_orphans_scoped(sqlite3 *db, const char *const *roots,
         sqlite3_finalize(stmt);
 
         for (int i = 0; i < dt_count; i++) {
-            sqlite3_stmt *del = NULL;
-            if (sqlite3_prepare_v2(db, "DELETE FROM tracks WHERE track_id=?",
-                                  -1, &del, NULL) == SQLITE_OK) {
-                sqlite3_bind_int(del, 1, dead_tracks[i]);
-                sqlite3_step(del);
-                sqlite3_finalize(del);
+            /* progress.track_id and bookmarks.track_id reference tracks with no
+             * ON DELETE action, so they default to NO ACTION and the delete
+             * below fails with a FOREIGN KEY violation for any track that has
+             * ever been played. That failure was silent, so the track row
+             * survived, its book kept a track, the zero-track pass never fired,
+             * and the deleted item stayed visible in the UI forever.
+             *
+             * Null the references first. They are nullable, and progress keeps
+             * track_ordinal, so a multi-track book losing one file keeps its
+             * position. A book losing its last track is removed by the
+             * zero-track pass, which cascades the progress row away anyway. */
+            static const char *const detach[] = {
+                "UPDATE progress SET track_id=NULL WHERE track_id=?",
+                "UPDATE bookmarks SET track_id=NULL WHERE track_id=?",
+                "DELETE FROM tracks WHERE track_id=?",
+            };
+            for (size_t s = 0; s < sizeof(detach) / sizeof(detach[0]); s++) {
+                sqlite3_stmt *st2 = NULL;
+                if (sqlite3_prepare_v2(db, detach[s], -1, &st2, NULL)
+                        != SQLITE_OK)
+                    continue;
+                sqlite3_bind_int(st2, 1, dead_tracks[i]);
+                if (sqlite3_step(st2) != SQLITE_DONE)
+                    fprintf(stderr, "[scan] orphan track %d: %s: %s\n",
+                            dead_tracks[i], detach[s], sqlite3_errmsg(db));
+                sqlite3_finalize(st2);
             }
             removed++;
         }
