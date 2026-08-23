@@ -6,10 +6,16 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#define AUDIOBOOK_PATH_SQL \
+/* Roots the audiobook app owns. HiBy's stock scanner walks the whole card and
+ * spells SD paths three ways, so each root needs all three forms. Keep in sync
+ * with AUDIOBOOK_LIBRARY_ROOT / AUDIOBOOK_PODCAST_ROOT in library.h. */
+#define APP_PATH_SQL \
     "(path LIKE 'a:\\Audiobooks\\%' COLLATE NOCASE " \
     "OR path LIKE '/mnt/sd_0/Audiobooks/%' COLLATE NOCASE " \
-    "OR path LIKE '/usr/data/mnt/sd_0/Audiobooks/%' COLLATE NOCASE)"
+    "OR path LIKE '/usr/data/mnt/sd_0/Audiobooks/%' COLLATE NOCASE " \
+    "OR path LIKE 'a:\\Podcasts\\%' COLLATE NOCASE " \
+    "OR path LIKE '/mnt/sd_0/Podcasts/%' COLLATE NOCASE " \
+    "OR path LIKE '/usr/data/mnt/sd_0/Podcasts/%' COLLATE NOCASE)"
 
 static int table_exists(sqlite3 *db, const char *table) {
     sqlite3_stmt *stmt = NULL;
@@ -52,9 +58,11 @@ static int scalar_int(sqlite3 *db, const char *sql, int *value) {
 
 static int delete_path_rows(sqlite3 *db, const char *table) {
     if (!table_exists(db, table)) return SQLITE_OK;
-    char sql[512];
+    /* Sized for APP_PATH_SQL (~310 bytes) plus the longest table name; leaves
+     * headroom so adding a root can't silently truncate into bad SQL. */
+    char sql[768];
     snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE %s", table,
-             AUDIOBOOK_PATH_SQL);
+             APP_PATH_SQL);
     return exec_sql(db, sql);
 }
 
@@ -151,7 +159,7 @@ static int cleanup_one_database(
         return 0;
     }
     if (scalar_int(db, "SELECT COUNT(*) FROM MEDIA_TABLE WHERE "
-                       AUDIOBOOK_PATH_SQL, &before) != 0) {
+                       APP_PATH_SQL, &before) != 0) {
         sqlite3_close(db);
         return -1;
     }
@@ -165,7 +173,7 @@ static int cleanup_one_database(
     if (exec_sql(db,
                  "CREATE TEMP TABLE r1_removed_media_ids(id INTEGER PRIMARY KEY);"
                  "INSERT OR IGNORE INTO r1_removed_media_ids "
-                 "SELECT id FROM MEDIA_TABLE WHERE " AUDIOBOOK_PATH_SQL) != SQLITE_OK)
+                 "SELECT id FROM MEDIA_TABLE WHERE " APP_PATH_SQL) != SQLITE_OK)
         goto rollback;
 
     static const char *path_tables[] = {
@@ -222,7 +230,7 @@ fail:
     return -1;
 }
 
-int music_catalog_remove_audiobooks(
+int music_catalog_remove_app_paths(
     const char *const *db_paths,
     size_t path_count,
     music_catalog_cleanup_result_t *result) {
@@ -255,19 +263,19 @@ int music_catalog_remove_audiobooks(
             continue;
         }
         local.databases_changed += changed;
-        local.audiobook_rows_removed += removed;
+        local.app_rows_removed += removed;
     }
     if (result) *result = local;
     return local.databases_failed ? -1 : 0;
 }
 
-int music_catalog_remove_audiobooks_default(
+int music_catalog_remove_app_paths_default(
     music_catalog_cleanup_result_t *result) {
     static const char *paths[] = {
         "/usr/data/usrlocal_media.db",
         "/data/usrlocal_media.db",
         "/usr/data/mnt/sd_0/usrlocal_media.db"
     };
-    return music_catalog_remove_audiobooks(
+    return music_catalog_remove_app_paths(
         paths, sizeof(paths) / sizeof(paths[0]), result);
 }

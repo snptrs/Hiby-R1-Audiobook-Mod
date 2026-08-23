@@ -69,11 +69,17 @@
 
 /* ---- Home screen items -------------------------------------------------- */
 
+/* Eight is the maximum that fits. Rows start at TITLE_BAR_H (76) and are
+ * HOME_ITEM_H (78) tall, so row 7 ends at 700; a ninth would span 700-778 with
+ * its label at 722, colliding with the refresh/error flash at y=720, and the
+ * footer text at 766 would land inside it. draw_home never reads scroll_offset
+ * and screen_is_scrollable excludes SCREEN_HOME, so there is no scrolling to
+ * fall back on. Podcasts therefore REPLACES Series rather than being added. */
 typedef enum {
     HOME_CONTINUE = 0,
     HOME_TITLES,
     HOME_AUTHORS,
-    HOME_SERIES,
+    HOME_PODCASTS,
     HOME_FOLDERS,
     HOME_FINISHED,
     HOME_REFRESH,
@@ -85,7 +91,7 @@ static const char *home_labels[HOME_ITEM_COUNT] = {
     "Continue",
     "Titles",
     "Authors",
-    "Series",
+    "Podcasts",
     "Folders",
     "Finished",
     "Refresh Library",
@@ -130,10 +136,10 @@ static void *catalog_worker_main(void *arg) {
      * screen closes. Retry in the background; the audiobook UI remains live. */
     for (int attempt = 1; attempt <= 3; attempt++) {
         memset(&cleanup, 0, sizeof(cleanup));
-        rc = music_catalog_remove_audiobooks_default(&cleanup);
+        rc = music_catalog_remove_app_paths_default(&cleanup);
         ui_log("[catalog] attempt=%d checked=%d changed=%d removed=%d "
                "failed=%d rc=%d\n", attempt, cleanup.databases_checked,
-               cleanup.databases_changed, cleanup.audiobook_rows_removed,
+               cleanup.databases_changed, cleanup.app_rows_removed,
                cleanup.databases_failed, rc);
         if (rc == 0) break;
         sleep(1);
@@ -169,7 +175,9 @@ static void *scan_worker_main(void *arg) {
     int open_rc = audiobook_db_open(AUDIOBOOK_DB_PATH, &db);
     audiobook_db_write_unlock();
     if (open_rc == 0) {
-        rc = audiobook_scan_library(db, AUDIOBOOK_LIBRARY_ROOT, NULL, NULL);
+        /* Scans every configured root. A root that does not exist is skipped
+         * silently, so a user with no /Podcasts folder never sees an error. */
+        rc = audiobook_scan_all(db, NULL, NULL);
         audiobook_db_close(db);
     }
     pthread_mutex_lock(&g_scan.mu);
@@ -1470,8 +1478,11 @@ static void draw_home(ui_state_t *ui) {
                              "Library refreshed", FONT_SCALE_2, COL_GREEN);
     }
     if (ui->refresh_err_until_ms && now_ms() < ui->refresh_err_until_ms) {
+        /* Storage-full is only one of several causes (a root that exists but
+         * fails to scan, a failed DB open), and there are now two roots, so
+         * don't name a cause we haven't established. */
         render_text_centered(r, 0, RENDER_FB_H - FOOTER_H - 36, RENDER_FB_W,
-                             "Scan failed: storage full", FONT_SCALE_2, COL_RED);
+                             "Scan failed", FONT_SCALE_2, COL_RED);
     }
 
     /* Footer */
@@ -1500,8 +1511,8 @@ static int handle_home_touch(ui_state_t *ui, int x, int y) {
         case HOME_AUTHORS:
             navigate_to(ui, SCREEN_LIST, LIST_AUTHORS, 0);
             break;
-        case HOME_SERIES:
-            navigate_to(ui, SCREEN_LIST, LIST_SERIES, 0);
+        case HOME_PODCASTS:
+            navigate_to(ui, SCREEN_LIST, LIST_SHOWS, 0);
             break;
         case HOME_FOLDERS:
             ui->folder_path[0] = '\0';   /* Folders tile always starts at root */
@@ -1555,11 +1566,15 @@ static int list_collect_cb(const audiobook_book_t *b, void *ctx) {
     strncpy(item->author, b->author, sizeof(item->author) - 1);
     item->author[sizeof(item->author) - 1] = '\0';
     item->duration_ms = b->total_duration_ms;
-    item->completed = b->completed;
+    item->kind = b->kind;
 
     audiobook_progress_t p;
     item->has_progress = (audiobook_get_progress(lc->db, b->book_id, &p) > 0);
     item->elapsed_ms = item->has_progress ? p.total_book_elapsed_ms : 0;
+    /* OR in progress.completed: nothing ever writes books.completed, so on its
+     * own the badge could never light up. */
+    item->completed = b->completed
+                      || (item->has_progress && p.completed);
     return 0;
 }
 
@@ -1578,6 +1593,16 @@ static void collect_list_books(ui_state_t *ui, list_ctx_t *lc) {
                                            list_collect_cb, lc); break;
         case LIST_TITLES:
             audiobook_list_books(ui->db, list_collect_cb, lc); break;
+        case LIST_SHOW_EPISODES:
+            audiobook_list_episodes_by_show(ui->db, ui->list_filter,
+                                            list_collect_cb, lc); break;
+        /* Strlist modes never reach here (rebuild_list takes the other
+         * branch), but naming them keeps this switch exhaustive so the
+         * whole-library default: below stays unreachable in practice. */
+        case LIST_AUTHORS:
+        case LIST_SERIES:
+        case LIST_SHOWS:
+            break;
         case LIST_FOLDERS: {
             /* Drill-down folder hierarchy. ui->folder_path ("") is the current
              * level; list every book whose root_path == folder_path, plus one
@@ -1654,10 +1679,15 @@ static void collect_list_books(ui_state_t *ui, list_ctx_t *lc) {
                         strncpy(it->author, author ? author : "", sizeof(it->author) - 1);
                         it->author[sizeof(it->author) - 1] = '\0';
                         it->duration_ms = dur;
-                        it->completed = completed;
+                        /* Folders only ever shows kind=0 (the query is rooted
+                         * at the Audiobooks root, which podcast paths cannot
+                         * fall inside). */
+                        it->kind = LIB_KIND_BOOK;
                         audiobook_progress_t p;
                         it->has_progress = (audiobook_get_progress(lc->db, bid, &p) > 0);
                         it->elapsed_ms = it->has_progress ? p.total_book_elapsed_ms : 0;
+                        it->completed = completed
+                                        || (it->has_progress && p.completed);
                     } else if (strncmp(rpath, prefix, plen) == 0 && rpath[plen] == '/') {
                         /* A book in a subfolder: record the immediate child name. */
                         const char *rest = rpath + plen + 1;
@@ -1730,6 +1760,7 @@ static void collect_list_books(ui_state_t *ui, list_ctx_t *lc) {
                         it->completed = 0;
                         it->has_progress = 0;
                         it->elapsed_ms = 0;
+                        it->kind = LIB_KIND_BOOK;
                     }
                     lc->count = total;
                 }
@@ -1789,8 +1820,13 @@ static void rebuild_home(ui_state_t *ui) {
     pthread_mutex_unlock(&g_cache_lock);
 }
 
+/* Keep in step with the strlist branch of handle_list_touch. */
+static int list_mode_is_strlist(list_mode_t m) {
+    return m == LIST_AUTHORS || m == LIST_SERIES || m == LIST_SHOWS;
+}
+
 static void rebuild_list(ui_state_t *ui) {
-    int is_str = (ui->list_mode == LIST_AUTHORS || ui->list_mode == LIST_SERIES);
+    int is_str = list_mode_is_strlist(ui->list_mode);
     if (is_str) {
         strlist_ctx_t sc;
         memset(&sc, 0, sizeof(sc));
@@ -1799,6 +1835,8 @@ static void rebuild_list(ui_state_t *ui) {
         if (sc.names) {
             if (ui->list_mode == LIST_AUTHORS)
                 audiobook_list_authors(ui->db, strlist_collect_cb, &sc);
+            else if (ui->list_mode == LIST_SHOWS)
+                audiobook_list_shows(ui->db, strlist_collect_cb, &sc);
             else
                 audiobook_list_series(ui->db, strlist_collect_cb, &sc);
         }
@@ -1843,11 +1881,26 @@ static void rebuild_list(ui_state_t *ui) {
 /* Rebuild the current-book cache (Detail / Now-Playing). with_cover=1 does
  * the (slow, event-thread) cover decode + copy into cur_cover_buf; pass 0 for
  * a progress-only refresh (leaves the cover untouched). */
+
+/* Does this item have any chapter rows? */
+static int book_has_chapters(sqlite3 *db, int book_id) {
+    sqlite3_stmt *stmt = NULL;
+    int has = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT 1 FROM chapters c JOIN tracks t ON t.track_id=c.track_id "
+            "WHERE t.book_id=? LIMIT 1", -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, book_id);
+    if (sqlite3_step(stmt) == SQLITE_ROW) has = 1;
+    sqlite3_finalize(stmt);
+    return has;
+}
+
 static void rebuild_current_book(ui_state_t *ui, int with_cover) {
     audiobook_book_t b;
     audiobook_progress_t p;
     char description[2048];
-    int bok = 0, pok = 0;
+    int bok = 0, pok = 0, has_ch = 0;
     const uint16_t *cov = NULL;
     memset(&b, 0, sizeof(b));
     memset(&p, 0, sizeof(p));
@@ -1855,6 +1908,13 @@ static void rebuild_current_book(ui_state_t *ui, int with_cover) {
     if (ui->current_book_id > 0) {
         if (audiobook_get_book(ui->db, ui->current_book_id, &b) > 0) bok = 1;
         if (audiobook_get_progress(ui->db, ui->current_book_id, &p) > 0) pok = 1;
+        /* Resolved here on the event thread so Detail and Now Playing can hide
+         * their Chapters buttons. Podcast episodes have no chapters unless the
+         * file ships real embedded ones, and a button leading to "No chapters"
+         * is worse than no button. LIMIT 1 rather than
+         * audiobook_get_chapters(NULL): that counts by walking every row, and
+         * this runs on every navigate. */
+        has_ch = book_has_chapters(ui->db, ui->current_book_id);
         if (with_cover && bok) {
             audiobook_get_book_description(ui->db, ui->current_book_id,
                                            description,
@@ -1865,6 +1925,7 @@ static void rebuild_current_book(ui_state_t *ui, int with_cover) {
     pthread_mutex_lock(&g_cache_lock);
     ui->cur_book = b; ui->cur_book_ok = bok;
     ui->cur_prog = p; ui->cur_prog_ok = pok;
+    ui->cur_has_chapters = has_ch;
     if (with_cover) {
         strncpy(ui->cur_description, description,
                 sizeof(ui->cur_description) - 1);
@@ -1982,6 +2043,8 @@ static void draw_list(ui_state_t *ui) {
         case LIST_CONTINUE:      title = "Continue"; break;
         case LIST_AUTHOR_BOOKS:  title = ui->list_filter; break;
         case LIST_SERIES_BOOKS:  title = ui->list_filter; break;
+        case LIST_SHOWS:         title = "Podcasts"; break;
+        case LIST_SHOW_EPISODES: title = ui->list_filter; break;
     }
 
     /* Header: "Back" left + title right (system style). Back is always
@@ -2029,7 +2092,8 @@ static void draw_list(ui_state_t *ui) {
         }
 
         char footer[64];
-        snprintf(footer, sizeof(footer), "%d items", count);
+        snprintf(footer, sizeof(footer), "%d %s", count,
+                 ui->list_mode == LIST_SHOWS ? "shows" : "items");
         render_draw_hline(r, 0, RENDER_FB_H - FOOTER_H, RENDER_FB_W, COL_DIVIDER);
         render_text_centered(r, 0, RENDER_FB_H - FOOTER_H + 10, RENDER_FB_W,
                             footer, FONT_SCALE_1, COL_GRAY_LT);
@@ -2089,10 +2153,15 @@ static void draw_list(ui_state_t *ui) {
         }
         int avail_w = RENDER_FB_W - text_x - right_margin;
 
-        /* Title (truncate to fit, reserving room for "Done" if completed) */
+        /* Title (truncate to fit, reserving room for the badge if completed).
+         * One variable for both the reserve here and the draw below: "Played"
+         * is wider than "Done", so two literals would let the title overlap
+         * the badge on podcast rows. */
+        const char *badge = (items[i].kind == LIB_KIND_PODCAST) ? "Played"
+                                                                : "Done";
         int title_max_w = avail_w;
         if (items[i].completed)
-            title_max_w -= render_text_width("Done", FONT_SCALE_1) + 16;
+            title_max_w -= render_text_width(badge, FONT_SCALE_1) + 16;
         char title_buf[256];
         strncpy(title_buf, items[i].title, sizeof(title_buf) - 1);
         title_buf[sizeof(title_buf) - 1] = '\0';
@@ -2147,7 +2216,7 @@ static void draw_list(ui_state_t *ui) {
         }
 
         if (items[i].completed) {
-            render_text_right(r, RENDER_FB_W - 18, item_top + 10, "Done",
+            render_text_right(r, RENDER_FB_W - 18, item_top + 10, badge,
                              FONT_SCALE_1, COL_GREEN);
         }
         }   /* end else (book row) */
@@ -2159,10 +2228,10 @@ static void draw_list(ui_state_t *ui) {
 
     /* Footer */
     char footer[64];
-    if (ui->list_mode == LIST_FOLDERS)
-        snprintf(footer, sizeof(footer), "%d items", count);
-    else
-        snprintf(footer, sizeof(footer), "%d books", count);
+    const char *noun = "books";
+    if (ui->list_mode == LIST_FOLDERS)            noun = "items";
+    else if (ui->list_mode == LIST_SHOW_EPISODES) noun = "episodes";
+    snprintf(footer, sizeof(footer), "%d %s", count, noun);
     render_draw_hline(r, 0, RENDER_FB_H - FOOTER_H, RENDER_FB_W, COL_DIVIDER);
     render_text_centered(r, 0, RENDER_FB_H - FOOTER_H + 10, RENDER_FB_W,
                         footer, FONT_SCALE_1, COL_GRAY_LT);
@@ -2184,8 +2253,11 @@ static int handle_list_touch(ui_state_t *ui, int x, int y) {
     int idx = (y - item_y) / LIST_ITEM_H;
     if (idx < 0) return 0;
 
-    /* Authors/Series: tap a name → filtered book list. */
-    if (ui->list_mode == LIST_AUTHORS || ui->list_mode == LIST_SERIES) {
+    /* Authors/Series/Shows: tap a name → filtered book or episode list. Uses
+     * the same predicate as rebuild_list, so a strlist mode can never render
+     * as a name list here and then fall through to the book path below (where
+     * !list_is_strlist fails and the tap silently does nothing). */
+    if (list_mode_is_strlist(ui->list_mode)) {
         char selected_name[256] = "";
         pthread_mutex_lock(&g_cache_lock);
         if (ui->list_is_strlist && idx < ui->strlist_count &&
@@ -2196,13 +2268,13 @@ static int handle_list_touch(ui_state_t *ui, int x, int y) {
         }
         pthread_mutex_unlock(&g_cache_lock);
         if (selected_name[0]) {
+            list_mode_t dest = LIST_SERIES_BOOKS;
+            if (ui->list_mode == LIST_AUTHORS)    dest = LIST_AUTHOR_BOOKS;
+            else if (ui->list_mode == LIST_SHOWS) dest = LIST_SHOW_EPISODES;
             strncpy(ui->list_filter, selected_name,
                     sizeof(ui->list_filter) - 1);
             ui->list_filter[sizeof(ui->list_filter) - 1] = '\0';
-            navigate_to(ui, SCREEN_LIST,
-                        ui->list_mode == LIST_AUTHORS ? LIST_AUTHOR_BOOKS
-                                                       : LIST_SERIES_BOOKS,
-                        0);
+            navigate_to(ui, SCREEN_LIST, dest, 0);
         }
         return 1;
     }
@@ -2337,13 +2409,17 @@ static void draw_detail(ui_state_t *ui) {
     int btn_y = DETAIL_BTN_ROW1_Y;
     int btn_w = (RENDER_FB_W - 48) / 2;
 
-    /* Row 1: Play, Chapters */
+    /* Row 1: Play, Chapters. Chapters is omitted entirely when the item has
+     * none (the usual case for a podcast episode); handle_detail_touch tests
+     * the same flag so the gap is not still tappable. */
     render_fill_rect(r, 16, btn_y, btn_w, 64, COL_GREEN);
     render_text_centered(r, 16, btn_y + 18, btn_w, "Play", FONT_SCALE_4,
                          COL_BLACK);
-    render_fill_rect(r, 32 + btn_w, btn_y, btn_w, 64, COL_GRAY);
-    render_text_centered(r, 32 + btn_w, btn_y + 18, btn_w, "Chapters",
-                         FONT_SCALE_4, COL_WHITE);
+    if (ui->cur_has_chapters) {
+        render_fill_rect(r, 32 + btn_w, btn_y, btn_w, 64, COL_GRAY);
+        render_text_centered(r, 32 + btn_w, btn_y + 18, btn_w, "Chapters",
+                             FONT_SCALE_4, COL_WHITE);
+    }
     btn_y = DETAIL_BTN_ROW2_Y;
 
     /* Row 2: Bookmarks, Menu */
@@ -2373,7 +2449,7 @@ static int handle_detail_touch(ui_state_t *ui, int x, int y) {
             navigate_to(ui, SCREEN_NOW_PLAYING, ui->list_mode,
                         ui->current_book_id);
             return 1;
-        } else if (x >= 32 + btn_w) {
+        } else if (x >= 32 + btn_w && ui->cur_has_chapters) {
             navigate_to(ui, SCREEN_CHAPTERS, ui->list_mode,
                         ui->current_book_id);
             return 1;
@@ -2592,9 +2668,13 @@ static void draw_now_playing(ui_state_t *ui) {
                              FONT_SCALE_4, spd_on ? COL_BLACK : COL_WHITE);
     }
 
-    render_fill_rect(r, b3, ctrl_y, w2, 52, COL_GRAY_DK);
-    render_text_centered(r, b3, ctrl_y + 12, w2, "Chaps",
-                         FONT_SCALE_4, COL_WHITE);
+    /* Omitted for items with no chapters (podcast episodes, normally), matching
+     * the Detail screen. handle_now_playing_touch gates on the same flag. */
+    if (ui->cur_has_chapters) {
+        render_fill_rect(r, b3, ctrl_y, w2, 52, COL_GRAY_DK);
+        render_text_centered(r, b3, ctrl_y + 12, w2, "Chaps",
+                             FONT_SCALE_4, COL_WHITE);
+    }
 
     pthread_mutex_unlock(&g_cache_lock);
 }
@@ -2721,7 +2801,7 @@ static int handle_now_playing_touch(ui_state_t *ui, int x, int y) {
             player_set_speed(sp[(i + 1) % 5]);
             return 1;
         }
-        if (x >= b3 && x < b3 + w2) {
+        if (x >= b3 && x < b3 + w2 && ui->cur_has_chapters) {
             navigate_to(ui, SCREEN_CHAPTERS, ui->list_mode,
                         ui->current_book_id);
             return 1;
@@ -2908,6 +2988,10 @@ static void draw_chapters(ui_state_t *ui) {
 
     if (count == 0) {
         pthread_mutex_unlock(&g_cache_lock);
+        /* Clear scroll_max before returning: it is shared across screens, so
+         * leaving the previous screen's value here lets an empty list
+         * drag-scroll. */
+        ui->scroll_max = 0;
         render_text_centered(r, 0, RENDER_FB_H / 2, RENDER_FB_W,
                             "No chapters", FONT_SCALE_2, COL_GRAY_LT);
         return;

@@ -188,13 +188,15 @@ static int upsert_book(sqlite3 *db, const char *book_key, const char *title,
                        const char *cover_path, const char *cover_cache_path,
                        int64_t total_duration_ms, int track_count,
                        int date_modified, int author_id, int series_id,
-                       const char *narrator, double series_number) {
+                       const char *narrator, double series_number, int kind) {
+    /* kind is in the DO UPDATE list so a folder moved between the Audiobooks
+     * and Podcasts roots is re-kinded rather than keeping its stale value. */
     const char *sql =
         "INSERT INTO books(book_key,title,sort_title,root_path,cover_path,"
         "cover_cache_path,total_duration_ms,track_count,fingerprint,"
         "date_added,date_modified,last_played_at,completed,playback_speed,"
-        "author_id,series_id,narrator,series_number) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "author_id,series_id,narrator,series_number,kind) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(book_key) DO UPDATE SET "
         "title=excluded.title,sort_title=excluded.sort_title,"
         "root_path=excluded.root_path,cover_path=excluded.cover_path,"
@@ -202,7 +204,8 @@ static int upsert_book(sqlite3 *db, const char *book_key, const char *title,
         "total_duration_ms=excluded.total_duration_ms,"
         "track_count=excluded.track_count,"
         "author_id=excluded.author_id,series_id=excluded.series_id,"
-        "narrator=excluded.narrator,series_number=excluded.series_number";
+        "narrator=excluded.narrator,series_number=excluded.series_number,"
+        "kind=excluded.kind";
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
@@ -229,6 +232,7 @@ static int upsert_book(sqlite3 *db, const char *book_key, const char *title,
     else sqlite3_bind_null(stmt, 16);
     sqlite3_bind_text(stmt, 17, narrator ? narrator : "", -1, SQLITE_TRANSIENT);
     sqlite3_bind_double(stmt, 18, series_number);
+    sqlite3_bind_int(stmt, 19, kind);
 
     int ret = (sqlite3_step(stmt) == SQLITE_DONE) ? 0 : -1;
     sqlite3_finalize(stmt);
@@ -445,24 +449,35 @@ static int get_or_create_series(sqlite3 *db, const char *display_name) {
 }
 
 /* ---- Path-derived metadata --------------------------------------------- */
-/* The library convention is /Audiobooks/<Author>/<Series>/<leaf book dir>/.
- * From the book's root_path relative to AUDIOBOOK_LIBRARY_ROOT we derive the
- * author (depth-1 ancestor) and series (depth-2 ancestor, if present). */
 
-static void derive_path_metadata(const char *root_path,
+/* Path of `path` relative to `root`, with leading slashes stripped. Returns
+ * NULL when path is not under root, or is root itself. Callers must handle
+ * NULL: passing a non-relative absolute path into the component split below
+ * yields an empty first component (everything before the leading '/'), which
+ * previously produced an empty author and a junk series named "usr". */
+static const char *path_relative_to(const char *root, const char *path) {
+    if (!root || !path) return NULL;
+    size_t rlen = strlen(root);
+    if (strncmp(path, root, rlen) != 0) return NULL;
+    const char *rel = path + rlen;
+    while (*rel == '/') rel++;
+    return *rel ? rel : NULL;
+}
+
+/* The library convention is /Audiobooks/<Author>/<Series>/<leaf book dir>/.
+ * From the book's root_path relative to the active library root we derive the
+ * author (depth-1 ancestor) and series (depth-2 ancestor, if present). The root
+ * is a parameter because the scanner now walks more than one. */
+
+static void derive_path_metadata(const char *root, const char *root_path,
                                  char *author, int author_sz,
                                  char *series, int series_sz) {
     if (author && author_sz > 0) author[0] = '\0';
     if (series && series_sz > 0) series[0] = '\0';
     if (!root_path) return;
 
-    const char *rel = root_path;
-    size_t rlen = strlen(AUDIOBOOK_LIBRARY_ROOT);
-    if (strncmp(root_path, AUDIOBOOK_LIBRARY_ROOT, rlen) == 0) {
-        rel = root_path + rlen;
-        while (*rel == '/') rel++;
-    }
-    if (!*rel) return;
+    const char *rel = path_relative_to(root, root_path);
+    if (!rel) return;
 
     char buf[512];
     strncpy(buf, rel, sizeof(buf) - 1);
@@ -625,20 +640,181 @@ static void find_cover_art(const char *dir_path, char *out, int out_len) {
  * fixed-width regardless. FNV-1a 64-bit is deterministic, so a re-scan reuses
  * the same cache file (idempotent overwrites via "wb"). Collisions across a
  * realistic library are negligible. */
-static void cover_cache_name(const char *book_key, char *out, int out_len) {
+static uint64_t fnv1a64(const char *s) {
     uint64_t h = 1469598103934665603ULL;  /* FNV-1a offset basis */
-    for (const char *p = book_key; *p; p++) {
+    for (const char *p = s; *p; p++) {
         h ^= (uint8_t)*p;
         h *= 1099511628211ULL;
     }
-    snprintf(out, out_len, "%016llx", (unsigned long long)h);
+    return h;
+}
+
+static void cover_cache_name(const char *book_key, char *out, int out_len) {
+    snprintf(out, out_len, "%016llx", (unsigned long long)fnv1a64(book_key));
+}
+
+/* ---- Podcast episode helpers -------------------------------------------- */
+
+/* Episode book_key. audiobook_derive_book_key collapses space, '-', '.', '_'
+ * and brackets all to a single '_', so per-FILE keys collide readily:
+ * "Ep 1.mp3", "Ep-1.mp3" and "Ep.1.mp3" all sanitize to the same string, and
+ * long names truncate to a shared prefix. A collision is silently destructive
+ * (the second upsert UPDATEs the first episode's row, then its track insert
+ * fails on UNIQUE(book_id, ordinal) and the episode vanishes), so append a
+ * hash of the full path to disambiguate. */
+static void derive_episode_key(const char *file_path, char *out, int out_len) {
+    if (!out || out_len <= 0) return;
+    char sane[384];
+    audiobook_derive_book_key(file_path, sane, sizeof(sane));
+    snprintf(out, out_len, "%s_%016llx", sane,
+             (unsigned long long)fnv1a64(file_path));
+}
+
+/* Episode display title from a filename: strip the extension only.
+ * Deliberately NOT clean_book_title, which strips a leading 4-digit year and
+ * would turn "2026-08-01 Interview.mp3" into "08-01 Interview" — eating the
+ * part that makes date-prefixed episodes sort correctly. */
+static void episode_title_from_name(const char *name, char *out, int out_sz) {
+    if (!out || out_sz <= 0) return;
+    const char *src = name ? name : "";
+    const char *dot = strrchr(src, '.');
+    int len = dot && dot != src ? (int)(dot - src) : (int)strlen(src);
+    if (len > out_sz - 1) len = out_sz - 1;
+    memcpy(out, src, (size_t)len);
+    out[len] = '\0';
+    if (out[0] == '\0') {
+        strncpy(out, src, out_sz - 1);
+        out[out_sz - 1] = '\0';
+    }
+}
+
+/* Name shown for files sitting loose in the podcast root rather than in a show
+ * folder. Not the root's own basename ("Podcasts"), which would render as
+ * Podcasts -> Podcasts -> episodes. */
+#define UNSORTED_SHOW_NAME "Unsorted"
+
+/* Show name for an episode folder: the folder's path RELATIVE to the podcast
+ * root, not its basename. series.display_name is UNIQUE, so basenames would
+ * merge unrelated shows whose folders happen to share a name ("2024",
+ * "Season 1", "Episodes"), interleaving two episode-index sequences into one
+ * list. path_relative_to returns NULL for the root itself, which is the
+ * loose-files case. */
+static void derive_show_name(const char *root, const char *dir_path,
+                             char *out, int out_sz) {
+    if (!out || out_sz <= 0) return;
+    const char *rel = path_relative_to(root, dir_path);
+    if (!rel) rel = UNSORTED_SHOW_NAME;
+    strncpy(out, rel, out_sz - 1);
+    out[out_sz - 1] = '\0';
+}
+
+/* ---- Podcast show folders ---------------------------------------------- */
+
+/* Upsert one show folder's files as one book row per file. Podcast episodes
+ * cannot be tracks of a shared "show" row because progress is keyed
+ * book_id PRIMARY KEY, so a show-as-book could hold only one resume point.
+ *
+ * root_path stays the SHOW FOLDER rather than the file: audiobook_cleanup_orphans
+ * deletes any book whose root_path is not a stat-able directory, so a file path
+ * there would be wiped on the next scan.
+ *
+ * Returns the number of episode rows upserted. cover_path is resolved once by
+ * the caller and shared by every episode, so the on-SD .r565 cache is shared
+ * rather than duplicated per episode. */
+static int process_podcast_dir(sqlite3 *db, const char *root, book_dir_t *bd,
+                               const char *cover_path) {
+    char show[256];
+    derive_show_name(root, bd->path, show, sizeof(show));
+    int series_id = show[0] ? get_or_create_series(db, show) : -1;
+
+    int upserted = 0;
+    for (int j = 0; j < bd->file_count; j++) {
+        audio_tags_t tags;
+        memset(&tags, 0, sizeof(tags));
+        audio_read_tags(bd->files[j].path, &tags);
+
+        char title[512];
+        if (tags.title[0]) {
+            strncpy(title, tags.title, sizeof(title) - 1);
+            title[sizeof(title) - 1] = '\0';
+        } else {
+            episode_title_from_name(bd->files[j].name, title, sizeof(title));
+        }
+        char sort_title[512];
+        audiobook_derive_sort_title(title, sort_title, sizeof(sort_title));
+
+        char book_key[512];
+        derive_episode_key(bd->files[j].path, book_key, sizeof(book_key));
+
+        /* Podcast files nearly always carry the show in the artist tag; fall
+         * back to the folder-derived show name. */
+        const char *author_name = tags.artist[0] ? tags.artist : show;
+        int author_id = get_or_create_author(db, author_name);
+
+        /* series_number is the episode's index in the natural filename sort
+         * collect_audio_files already applied. The episode list orders by it
+         * descending, so this is what makes "newest first" work for
+         * date-prefixed and numbered filenames. */
+        if (upsert_book(db, book_key, title, sort_title, bd->path,
+                        cover_path, "", tags.duration_ms, 1,
+                        tags.file_mtime, author_id, series_id, "",
+                        (double)(j + 1), LIB_KIND_PODCAST) < 0) {
+            fprintf(stderr, "[scan] upsert episode failed for %s\n",
+                    bd->files[j].path);
+            continue;
+        }
+        int book_id = get_book_id_by_key(db, book_key);
+        if (book_id < 0) continue;
+        if (tags.description[0])
+            upsert_book_description(db, book_id, tags.description);
+
+        char track_title[512];
+        strncpy(track_title, title, sizeof(track_title) - 1);
+        track_title[sizeof(track_title) - 1] = '\0';
+        if (upsert_track(db, book_id, 1, 1, j + 1, bd->files[j].path,
+                         track_title, sort_title, tags.duration_ms,
+                         tags.embedded_chapters, tags.file_size,
+                         tags.file_mtime) < 0)
+            continue;
+
+        /* Real embedded chapters are still useful (some shows ship them), but
+         * nothing is synthesized: the single-file fallback would give every
+         * episode one meaningless "Chapter 1". */
+        char chapter_titles[1024];
+        chapter_titles[0] = '\0';
+        int track_id = get_track_id_by_path(db, bd->files[j].path);
+        if (track_id > 0) {
+            delete_chapters_for_track(db, track_id);
+            int chapter_format = (bd->files[j].type == AUDIO_EXT_MP3 ||
+                                  bd->files[j].type == AUDIO_EXT_M4B ||
+                                  bd->files[j].type == AUDIO_EXT_M4A);
+            if (chapter_format) {
+                scan_chapter_ctx_t cctx;
+                cctx.db = db;
+                cctx.track_id = track_id;
+                cctx.chapter_titles = chapter_titles;
+                cctx.chapter_titles_sz = (int)sizeof(chapter_titles);
+                cctx.count = 0;
+                cctx.book_offset_ms = 0;
+                audio_read_chapters(bd->files[j].path, scan_chapter_cb, &cctx);
+            }
+        }
+        /* Outside the track_id block: an episode that failed its track lookup
+         * still needs an FTS row, or it becomes unsearchable. */
+        update_fts_index(db, book_id, title, author_name, "", show,
+                         chapter_titles);
+        upserted++;
+    }
+    return upserted;
 }
 
 /* ---- Main scan ---------------------------------------------------------- */
 
-int audiobook_scan_library(sqlite3 *db, const char *root_path,
-                           scan_progress_cb progress, void *ctx) {
+int audiobook_scan_root(sqlite3 *db, const char *root_path, int kind,
+                        const char *label,
+                        scan_progress_cb progress, void *ctx) {
     if (!db || !root_path) return -1;
+    if (!label) label = (kind == LIB_KIND_PODCAST) ? "Podcasts" : "Audiobooks";
 
     struct stat root_st;
     if (stat(root_path, &root_st) < 0 || !S_ISDIR(root_st.st_mode)) {
@@ -679,7 +855,10 @@ int audiobook_scan_library(sqlite3 *db, const char *root_path,
      * them through its normal JPEG + .r565 cache path. Best-effort: ignore
      * EEXIST; if the dir can't be created, embedded-cover extraction below
      * simply fails to write and those books show no cover (non-fatal). */
-    mkdir(AUDIOBOOK_LIBRARY_ROOT "/.covercache", 0755);
+    char covercache_dir[MAX_PATH_LEN];
+    snprintf(covercache_dir, sizeof(covercache_dir), "%s/.covercache",
+             root_path);
+    mkdir(covercache_dir, 0755);
 
     /* Ensure library_roots entry exists */
     sqlite3_stmt *lr_stmt = NULL;
@@ -688,7 +867,7 @@ int audiobook_scan_library(sqlite3 *db, const char *root_path,
         "ON CONFLICT(path) DO UPDATE SET last_scan_started_at=?",
         -1, &lr_stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(lr_stmt, 1, root_path, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(lr_stmt, 2, "Audiobooks", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(lr_stmt, 2, label, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(lr_stmt, 3, (int)time(NULL));
         sqlite3_step(lr_stmt);
         sqlite3_finalize(lr_stmt);
@@ -720,10 +899,12 @@ int audiobook_scan_library(sqlite3 *db, const char *root_path,
 
         if (progress) progress(2, i + 1, book_count, bd->path, ctx);
 
-        /* Collect audio files */
+        /* Collect audio files. Every early exit below must go through
+         * next_book: bd->files is a ~786 KB calloc and bare `continue`s used to
+         * leak it on a 56 MB device. */
         if (collect_audio_files(bd->path, &bd->files, &bd->file_count) < 0)
-            continue;
-        if (bd->file_count == 0) continue;
+            goto next_book;
+        if (bd->file_count == 0) goto next_book;
 
         /* Derive book_key */
         char book_key[512];
@@ -749,10 +930,12 @@ int audiobook_scan_library(sqlite3 *db, const char *root_path,
         find_cover_art(bd->path, cover_path, sizeof(cover_path));
         if (!cover_path[0] && bd->file_count > 0) {
             char cname[24];
+            /* Keyed on the folder's book_key, so every episode in a show
+             * shares one extracted image and one .r565 cache entry. */
             cover_cache_name(book_key, cname, sizeof(cname));
             char cache_base[MAX_PATH_LEN], cache_path[MAX_PATH_LEN];
-            snprintf(cache_base, sizeof(cache_base),
-                     AUDIOBOOK_LIBRARY_ROOT "/.covercache/%s", cname);
+            snprintf(cache_base, sizeof(cache_base), "%s/%s",
+                     covercache_dir, cname);
             if (audio_extract_cover(bd->files[0].path, cache_base,
                                     cache_path, sizeof(cache_path)) == 1) {
                 strncpy(cover_path, cache_path, sizeof(cover_path) - 1);
@@ -760,10 +943,27 @@ int audiobook_scan_library(sqlite3 *db, const char *root_path,
             }
         }
 
+        /* Persist both .r565 sizes next to the source so the first on-screen
+         * view is a cheap cache hit rather than a libjpeg decode stall. Runs on
+         * the event thread (scan is invoked from handle_home_touch), so it is
+         * off the render thread by construction, and each call has its own
+         * jmp_buf so it is re-entrant with the thumbnail pre-warm. */
+        if (cover_path[0]) {
+            cover_precache(cover_path, COVER_PX);
+            cover_precache(cover_path, COVER_THUMB_PX);
+        }
+
+        /* Podcast roots: one book row per FILE, not one book per folder. */
+        if (kind == LIB_KIND_PODCAST) {
+            changed_count += process_podcast_dir(db, root_path, bd, cover_path);
+            goto next_book;
+        }
+
         /* Derive author/series from the path convention
          * /Audiobooks/<Author>/<Series>/<leaf>/. */
         char path_author[256], path_series[256];
-        derive_path_metadata(bd->path, path_author, sizeof(path_author),
+        derive_path_metadata(root_path, bd->path,
+                             path_author, sizeof(path_author),
                              path_series, sizeof(path_series));
         double series_number = parse_series_number(dir_name);
 
@@ -811,29 +1011,16 @@ int audiobook_scan_library(sqlite3 *db, const char *root_path,
         if (upsert_book(db, book_key, title, sort_title, bd->path,
                         cover_path, "", total_duration, bd->file_count,
                         latest_mtime, author_id, series_id, narrator,
-                        series_number) < 0) {
+                        series_number, LIB_KIND_BOOK) < 0) {
             fprintf(stderr, "[scan] upsert_book failed for %s\n", bd->path);
-            continue;
+            goto next_book;
         }
 
         int book_id = get_book_id_by_key(db, book_key);
-        if (book_id < 0) continue;
+        if (book_id < 0) goto next_book;
         upsert_book_description(db, book_id, description);
 
         changed_count++;
-
-        /* Pre-decode the cover to both sizes and persist the small .r565
-         * caches on the SD (next to the source). This runs on the event thread
-         * (scan is invoked from handle_home_touch), so it's off the render
-         * thread by construction, and makes the first on-screen view of each
-         * book a cheap load_r565 hit — no libjpeg decode stall on the event
-         * thread when the user opens it. Best-effort: a missing/undecodable
-         * cover just means a later lazy decode. Each call has its own jmp_buf,
-         * so this is re-entrant with the event-thread thumbnail pre-warm. */
-        if (cover_path[0]) {
-            cover_precache(cover_path, COVER_PX);
-            cover_precache(cover_path, COVER_THUMB_PX);
-        }
 
         /* Accumulate chapter titles across all tracks for the FTS index. */
         char chapter_titles[4096];
@@ -941,7 +1128,7 @@ int audiobook_scan_library(sqlite3 *db, const char *root_path,
         update_fts_index(db, book_id, title, author_name, narrator,
                          series_name, chapter_titles);
 
-        /* Free file list */
+    next_book:
         free(bd->files);
         bd->files = NULL;
     }
@@ -962,14 +1149,15 @@ int audiobook_scan_library(sqlite3 *db, const char *root_path,
         sqlite3_finalize(lr_done);
     }
 
-    /* Cleanup orphans */
-    audiobook_cleanup_orphans(db, progress, ctx);
+    /* Orphan cleanup is NOT called here. It has no root filter, so running it
+     * per-root would let one root's pass delete rows belonging to a root whose
+     * files have not been re-upserted yet. audiobook_scan_all runs it once,
+     * after every root, scoped to the roots that actually scanned. */
 
     /* Commit the scan transaction. If this fails (SQLITE_FULL on /usr/data
      * filling up while writing the commit frame), the transaction did not
      * commit — roll it back so the WAL resets to the pre-scan state instead
-     * of leaving a stale large WAL behind (the freeze trigger). VACUUM then
-     * runs only on a clean commit; on abort we bail without compacting. */
+     * of leaving a stale large WAL behind (the freeze trigger). */
     if (tx_active) {
         int commit_rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
         if (commit_rc != SQLITE_OK) {
@@ -982,25 +1170,124 @@ int audiobook_scan_library(sqlite3 *db, const char *root_path,
     }
     audiobook_db_write_unlock();
 
-    /* Compact library.db after prunes. SQLite keeps freed pages inside the
-     * file unless VACUUM'd, so over many card swaps (each leaving pruned
-     * rows behind) the file would only grow. VACUUM rebuilds it in place.
-     * Best-effort: it needs ~DB-size free temp space (the SD has gigabytes),
-     * and a failure leaves the DB working — just not compact.
-     * No active transaction is open here (COMMIT above closed it). */
-    sqlite3_exec(db, "VACUUM", NULL, NULL, NULL);
-
     if (progress) progress(5, changed_count, book_count, "done", ctx);
 
     free(books);
     return 0;
 }
 
+/* The roots the app owns. Order matters only for progress reporting. Keep in
+ * sync with APP_PATH_SQL in music_catalog.c, which hides these from HiBy's
+ * stock Music catalog. */
+static const struct {
+    const char *path;
+    int kind;
+    const char *label;
+} SCAN_ROOTS[] = {
+    { AUDIOBOOK_LIBRARY_ROOT, LIB_KIND_BOOK,    "Audiobooks" },
+    { AUDIOBOOK_PODCAST_ROOT, LIB_KIND_PODCAST, "Podcasts"   },
+};
+#define SCAN_ROOT_COUNT ((int)(sizeof(SCAN_ROOTS) / sizeof(SCAN_ROOTS[0])))
+
+int audiobook_scan_library(sqlite3 *db, const char *root_path,
+                           scan_progress_cb progress, void *ctx) {
+    return audiobook_scan_root(db, root_path, LIB_KIND_BOOK, "Audiobooks",
+                               progress, ctx);
+}
+
+int audiobook_scan_all(sqlite3 *db, scan_progress_cb progress, void *ctx) {
+    if (!db) return -1;
+
+    const char *scanned[SCAN_ROOT_COUNT];
+    int scanned_n = 0;
+    int failures = 0;
+
+    for (int i = 0; i < SCAN_ROOT_COUNT; i++) {
+        struct stat st;
+        /* A root that is simply absent is not an error: plenty of users will
+         * never create /Podcasts. Only a root that exists and then fails to
+         * scan counts as a failure. */
+        if (stat(SCAN_ROOTS[i].path, &st) < 0 || !S_ISDIR(st.st_mode))
+            continue;
+        if (audiobook_scan_root(db, SCAN_ROOTS[i].path, SCAN_ROOTS[i].kind,
+                                SCAN_ROOTS[i].label, progress, ctx) < 0) {
+            failures++;
+            continue;
+        }
+        scanned[scanned_n++] = SCAN_ROOTS[i].path;
+    }
+
+    /* Nothing resolved (card unmounted, or neither folder exists): do NOT run
+     * cleanup. Every book would fail its root_path stat and be deleted along
+     * with its .pos and bookmark sidecars, which are the authoritative copies.
+     * A missing card must never look like an empty library. */
+    if (scanned_n == 0) {
+        if (progress) progress(5, 0, 0, "no library roots found", ctx);
+        return failures ? -1 : 0;
+    }
+
+    audiobook_db_write_lock();
+    int tx = (sqlite3_exec(db, "BEGIN", NULL, NULL, NULL) == SQLITE_OK);
+    audiobook_cleanup_orphans_scoped(db, scanned, scanned_n, progress, ctx);
+    if (tx && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK)
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    audiobook_db_write_unlock();
+
+    /* Compact library.db once per refresh, not once per root: SQLite keeps
+     * freed pages inside the file unless VACUUM'd, so over many card swaps it
+     * would only grow. Must be outside any transaction. Best-effort — a
+     * failure leaves the DB working, just not compact. */
+    sqlite3_exec(db, "VACUUM", NULL, NULL, NULL);
+
+    return failures ? -1 : 0;
+}
+
 /* ---- Orphan cleanup ----------------------------------------------------- */
 
-int audiobook_cleanup_orphans(sqlite3 *db, scan_progress_cb progress,
-                              void *ctx) {
+/* Is path inside one of the roots that actually scanned this pass? Books under
+ * a root that did not resolve are left strictly alone: otherwise a renamed or
+ * unmounted /Audiobooks would look like "every book deleted", and the deletion
+ * takes the .pos and bookmark sidecars with it — those are the authoritative
+ * copies of resume positions, so the loss is unrecoverable. */
+static int path_under_any_root(const char *path, const char *const *roots,
+                               int n_roots) {
+    if (!path) return 0;
+    for (int i = 0; i < n_roots; i++) {
+        size_t rlen = strlen(roots[i]);
+        if (strncmp(path, roots[i], rlen) == 0
+            && (path[rlen] == '\0' || path[rlen] == '/'))
+            return 1;
+    }
+    return 0;
+}
+
+/* Delete one book plus everything keyed to it: the FK cascade covers tracks,
+ * chapters, progress and bookmarks; book_search, the .pos file and the SD
+ * bookmark file are not covered and must be removed explicitly. */
+static void delete_book_row(sqlite3 *db, int book_id) {
+    sqlite3_stmt *del = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM books WHERE book_id=?",
+                          -1, &del, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(del, 1, book_id);
+        sqlite3_step(del);
+        sqlite3_finalize(del);
+    }
+    if (sqlite3_prepare_v2(db, "DELETE FROM book_search WHERE book_id=?",
+                          -1, &del, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(del, 1, book_id);
+        sqlite3_step(del);
+        sqlite3_finalize(del);
+    }
+    pos_remove_sd(book_id);
+    bookmark_remove_book_sd(book_id);
+}
+
+int audiobook_cleanup_orphans_scoped(sqlite3 *db, const char *const *roots,
+                                     int n_roots, scan_progress_cb progress,
+                                     void *ctx) {
     int removed = 0;
+
+    if (!db || !roots || n_roots <= 0) return 0;
 
     if (progress) progress(4, 0, 0, "cleaning orphans", ctx);
 
@@ -1020,6 +1307,7 @@ int audiobook_cleanup_orphans(sqlite3 *db, scan_progress_cb progress,
         int book_id = sqlite3_column_int(stmt, 0);
         const char *rpath = (const char *)sqlite3_column_text(stmt, 1);
         if (!rpath) continue;
+        if (!path_under_any_root(rpath, roots, n_roots)) continue;
         struct stat st;
         if (stat(rpath, &st) < 0 || !S_ISDIR(st.st_mode)) {
             if (!dead_ok) continue;
@@ -1036,25 +1324,7 @@ int audiobook_cleanup_orphans(sqlite3 *db, scan_progress_cb progress,
 
     /* Delete dead books (cascades to tracks, chapters, progress, bookmarks) */
     for (int i = 0; i < dead_count; i++) {
-        sqlite3_stmt *del = NULL;
-        if (sqlite3_prepare_v2(db, "DELETE FROM books WHERE book_id=?",
-                              -1, &del, NULL) == SQLITE_OK) {
-            sqlite3_bind_int(del, 1, dead_ids[i]);
-            sqlite3_step(del);
-            sqlite3_finalize(del);
-        }
-        /* Also delete from FTS */
-        if (sqlite3_prepare_v2(db, "DELETE FROM book_search WHERE book_id=?",
-                              -1, &del, NULL) == SQLITE_OK) {
-            sqlite3_bind_int(del, 1, dead_ids[i]);
-            sqlite3_step(del);
-            sqlite3_finalize(del);
-        }
-        /* Drop the SD position file too so stale .pos don't accumulate for
-         * books whose folder is gone. */
-        pos_remove_sd(dead_ids[i]);
-        /* And the SD bookmark file for the same reason. */
-        bookmark_remove_book_sd(dead_ids[i]);
+        delete_book_row(db, dead_ids[i]);
         removed++;
     }
 
@@ -1097,9 +1367,61 @@ int audiobook_cleanup_orphans(sqlite3 *db, scan_progress_cb progress,
         free(dead_tracks);
     }
 
+    /* Books left with no tracks. Needed because a podcast episode's root_path
+     * is its SHOW FOLDER, which survives deleting the episode file: the pass
+     * above removes the track but the book row would linger forever.
+     *
+     * Must run AFTER the dead-track pass, or the tracks it looks for have not
+     * been deleted yet. root_path must still stat as a directory, so a
+     * transient SD read failure cannot cascade into destroying sidecars —
+     * book_id is a rowid and gets reused, so a stale <id>.pos could otherwise
+     * later attach to an unrelated episode. */
+    if (sqlite3_prepare_v2(db,
+            "SELECT b.book_id,b.root_path FROM books b "
+            "WHERE NOT EXISTS (SELECT 1 FROM tracks t WHERE t.book_id=b.book_id)",
+            -1, &stmt, NULL) == SQLITE_OK) {
+        int *empty_ids = NULL;
+        int e_count = 0, e_cap = 64;
+        empty_ids = malloc(e_cap * sizeof(int));
+        int e_ok = (empty_ids != NULL);
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int book_id = sqlite3_column_int(stmt, 0);
+            const char *rpath = (const char *)sqlite3_column_text(stmt, 1);
+            if (!rpath) continue;
+            if (!path_under_any_root(rpath, roots, n_roots)) continue;
+            struct stat st;
+            if (stat(rpath, &st) < 0 || !S_ISDIR(st.st_mode)) continue;
+            if (!e_ok) continue;
+            if (e_count >= e_cap) {
+                e_cap *= 2;
+                int *ne = realloc(empty_ids, e_cap * sizeof(int));
+                if (!ne) { e_ok = 0; continue; }
+                empty_ids = ne;
+            }
+            empty_ids[e_count++] = book_id;
+        }
+        sqlite3_finalize(stmt);
+
+        for (int i = 0; i < e_count; i++) {
+            delete_book_row(db, empty_ids[i]);
+            removed++;
+        }
+        free(empty_ids);
+    }
+
     free(dead_ids);
 
     if (progress) progress(4, removed, 0, "orphans removed", ctx);
 
     return removed;
+}
+
+int audiobook_cleanup_orphans(sqlite3 *db, scan_progress_cb progress,
+                              void *ctx) {
+    static const char *const roots[] = {
+        AUDIOBOOK_LIBRARY_ROOT, AUDIOBOOK_PODCAST_ROOT
+    };
+    return audiobook_cleanup_orphans_scoped(
+        db, roots, (int)(sizeof(roots) / sizeof(roots[0])), progress, ctx);
 }

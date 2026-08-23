@@ -29,7 +29,14 @@ typedef enum {
     SCREEN_CHAPTERS,
 } ui_screen_t;
 
-/* List view modes (what SCREEN_LIST shows) */
+/* List view modes (what SCREEN_LIST shows).
+ *
+ * Adding one means touching SIX coupled sites in ui.c or it fails silently:
+ * the is_str predicate in rebuild_list, the collect_list_books switch (whose
+ * default: lists the WHOLE library), the title switch and footer wording in
+ * draw_list, and the strlist branch in handle_list_touch (which tests
+ * list_mode, not list_is_strlist, so a missing entry renders fine and then
+ * no-ops on tap). The build has no -Wall, so nothing warns. */
 typedef enum {
     LIST_TITLES = 0,
     LIST_AUTHORS,
@@ -39,6 +46,8 @@ typedef enum {
     LIST_CONTINUE,
     LIST_AUTHOR_BOOKS,
     LIST_SERIES_BOOKS,
+    LIST_SHOWS,          /* podcast shows (strlist) */
+    LIST_SHOW_EPISODES,  /* one show's episodes, filtered by list_filter */
 } list_mode_t;
 
 /* ---- Render-cache row structs (built by the event thread, read by the
@@ -56,6 +65,10 @@ typedef struct {
     int completed;
     int has_progress;
     int64_t elapsed_ms;
+    /* lib_kind_t: selects the "Played" vs "Done" badge. Must be set at EVERY
+     * row-construction site — the list_items buffer grows via realloc, so an
+     * unset field is garbage rather than zero. */
+    int kind;
 } list_item_t;
 
 /* A row in the Bookmarks screen. */
@@ -264,6 +277,11 @@ typedef struct {
     char cur_description[2048];
     uint16_t cur_cover_buf[COVER_PX * COVER_PX];
     int cur_cover_ok;
+    /* Whether the current item has any chapters. Cached here because ch_rows is
+     * only built on entering SCREEN_CHAPTERS, but Detail and Now Playing need
+     * to know before that to hide their Chapters buttons. Podcast episodes have
+     * none unless the file ships real embedded chapters. */
+    int cur_has_chapters;
 
     /* Bookmarks / Chapters screen caches. */
     bookmark_row_t *bm_rows;

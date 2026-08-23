@@ -12,7 +12,10 @@ from contextlib import closing
 from pathlib import Path
 
 
-AUDIOBOOK_LIKE = r"a:\Audiobooks\%"
+# Roots the native app owns and must strip from the stock Music catalog. Must
+# match APP_PATH_SQL in audiobook_app/music_catalog.c.
+APP_LIKES = (r"a:\Audiobooks\%", r"a:\Podcasts\%")
+APP_MATCH = " OR ".join("path LIKE ? COLLATE NOCASE" for _ in APP_LIKES)
 PATH_TABLES = (
     "MEDIA_TABLE",
     "MEDIA2_TABLE",
@@ -62,6 +65,10 @@ def create_synthetic_fixture(path: Path) -> None:
             (2, r"a:\Music\Only Music.flac", "Music Only", "Musician", "Rock", "Musician", 11, 21),
             (100, r"a:\Audiobooks\Shared\01.mp3", "Shared", "Same Author", "Spoken", "Same Author", 12, 22),
             (101, r"a:\Audiobooks\Book Only\Book.m4b", "Book Only", "Writer", "Audiobook", "Writer", 13, 23),
+            # Podcast episode sharing artist/album_artist with a Music row, so
+            # catalog reconciliation has to keep that Music row intact.
+            (200, r"a:\Podcasts\Some Show\2026-08-01 Ep1.mp3", "Some Show", "Same Author", "Podcast", "Same Author", 14, 24),
+            (201, r"a:\Podcasts\Some Show\2026-08-08 Ep2.mp3", "Some Show", "Show Host", "Podcast", "Show Host", 15, 25),
         ]
         db.executemany("INSERT INTO MEDIA_TABLE VALUES (?,?,?,?,?,?,?,?)", rows)
         for table in PATH_TABLES[1:]:
@@ -84,9 +91,9 @@ def create_synthetic_fixture(path: Path) -> None:
         for table in ("FORMAT_TABLE", "FORMAT2_TABLE"):
             db.executemany(
                 f"INSERT INTO {table}(id,format,cn) VALUES (?,?,?)",
-                [(1, "MP3", 2), (2, "FLAC", 1), (101, "M4B", 1)],
+                [(1, "MP3", 4), (2, "FLAC", 1), (101, "M4B", 1)],
             )
-        for value in (4, 3, 3, 3, 3):
+        for value in (6, 4, 4, 4, 4):
             db.execute("INSERT INTO COUNT_TABLE(cn) VALUES (?)", (value,))
         for row in rows:
             db.execute("INSERT INTO CTIME_TABLE VALUES (?)", (row[0],))
@@ -103,8 +110,8 @@ def table_exists(db: sqlite3.Connection, table: str) -> bool:
 
 def music_rows(db: sqlite3.Connection) -> list[tuple]:
     return db.execute(
-        "SELECT * FROM MEDIA_TABLE WHERE path NOT LIKE ? COLLATE NOCASE ORDER BY id,path",
-        (AUDIOBOOK_LIKE,),
+        f"SELECT * FROM MEDIA_TABLE WHERE NOT ({APP_MATCH}) ORDER BY id,path",
+        APP_LIKES,
     ).fetchall()
 
 
@@ -122,19 +129,17 @@ def main() -> int:
             create_synthetic_fixture(db_path)
         with closing(sqlite3.connect(db_path)) as db:
             before_music = music_rows(db)
-            audiobook_ids = {
+            app_ids = {
                 row[0]
                 for row in db.execute(
-                    "SELECT id FROM MEDIA_TABLE WHERE path LIKE ? COLLATE NOCASE",
-                    (AUDIOBOOK_LIKE,),
+                    f"SELECT id FROM MEDIA_TABLE WHERE {APP_MATCH}", APP_LIKES
                 )
             }
-            before_audiobooks = db.execute(
-                "SELECT COUNT(*) FROM MEDIA_TABLE WHERE path LIKE ? COLLATE NOCASE",
-                (AUDIOBOOK_LIKE,),
+            before_app = db.execute(
+                f"SELECT COUNT(*) FROM MEDIA_TABLE WHERE {APP_MATCH}", APP_LIKES
             ).fetchone()[0]
-        if before_audiobooks <= 0:
-            raise AssertionError("fixture has no /Audiobooks rows")
+        if before_app <= 0:
+            raise AssertionError("fixture has no /Audiobooks or /Podcasts rows")
 
         first = subprocess.run(
             [str(args.helper.resolve()), str(db_path.resolve())],
@@ -148,7 +153,7 @@ def main() -> int:
             text=True,
             capture_output=True,
         )
-        if f"removed={before_audiobooks}" not in first.stdout:
+        if f"removed={before_app}" not in first.stdout:
             raise AssertionError(f"unexpected first result: {first.stdout.strip()}")
         if "changed=0 removed=0" not in second.stdout:
             raise AssertionError(f"cleanup is not idempotent: {second.stdout.strip()}")
@@ -160,11 +165,10 @@ def main() -> int:
                 if not table_exists(db, table):
                     continue
                 leaked = db.execute(
-                    f"SELECT COUNT(*) FROM {table} WHERE path LIKE ? COLLATE NOCASE",
-                    (AUDIOBOOK_LIKE,),
+                    f"SELECT COUNT(*) FROM {table} WHERE {APP_MATCH}", APP_LIKES
                 ).fetchone()[0]
                 if leaked:
-                    raise AssertionError(f"{table} retains {leaked} audiobook rows")
+                    raise AssertionError(f"{table} retains {leaked} app rows")
             for table, column in CATALOGS:
                 if not table_exists(db, table):
                     continue
@@ -213,7 +217,7 @@ def main() -> int:
                     continue
                 ids = {row[0] for row in db.execute(f"SELECT media_id FROM {table}")}
                 media_ids = {row[0] for row in db.execute("SELECT id FROM MEDIA_TABLE")}
-                if ids != media_ids or ids.intersection(audiobook_ids):
+                if ids != media_ids or ids.intersection(app_ids):
                     raise AssertionError(f"{table} does not exactly index remaining Music rows")
             integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
             if integrity != "ok":
@@ -222,7 +226,7 @@ def main() -> int:
         print(first.stdout.strip())
         print(second.stdout.strip())
         print(
-            f"PASS: removed {before_audiobooks} audiobook rows; "
+            f"PASS: removed {before_app} app rows; "
             f"preserved {len(before_music)} Music rows"
         )
     return 0

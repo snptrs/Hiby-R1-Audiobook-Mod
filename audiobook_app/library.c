@@ -48,7 +48,8 @@ static const char *SCHEMA_SQL =
   "last_played_at INTEGER,"
   "completed INTEGER NOT NULL DEFAULT 0,"
   "completed_at INTEGER,"
-  "playback_speed REAL NOT NULL DEFAULT 1.0"
+  "playback_speed REAL NOT NULL DEFAULT 1.0,"
+  "kind INTEGER NOT NULL DEFAULT 0"
 ");"
 "CREATE TABLE IF NOT EXISTS book_metadata("
   "book_id INTEGER PRIMARY KEY REFERENCES books(book_id) ON DELETE CASCADE,"
@@ -142,116 +143,117 @@ static const char *SCHEMA_SQL =
 "CREATE INDEX IF NOT EXISTS idx_tracks_path ON tracks(path);"
 "CREATE INDEX IF NOT EXISTS idx_bookmarks_book_created ON bookmarks(book_id, created_at DESC);";
 
+/* Additive column migrations for DBs created by an older build. Kept OUT of
+ * SCHEMA_SQL on purpose: that runs as one exec whose failure is fatal in
+ * audiobook_db_open, and ALTER TABLE ADD COLUMN errors with "duplicate column
+ * name" on every run after the first — which would stop the library opening.
+ * Each statement here is exec'd separately with its result ignored. */
+static const char *const MIGRATION_SQL[] = {
+    "ALTER TABLE books ADD COLUMN kind INTEGER NOT NULL DEFAULT 0",
+};
+
 /* ---- SQL statements (from orphaned binary) ---------------------------- */
 
-#define SQL_GET_BOOK_BY_KEY \
-    "SELECT b.book_id,b.book_key,b.title,b.sort_title," \
+/* The book column list, shared by every query that feeds
+ * fill_book_from_stmt(). It was duplicated across seven constants; a single
+ * macro is what makes adding a column safe, because a SELECT that omits one
+ * does NOT error — sqlite3_column_int() past the last column quietly returns
+ * 0, so a half-updated set of constants would silently read every podcast
+ * episode as an audiobook. Append new columns at the END; fill_book_from_stmt
+ * reads by position. */
+#define SQL_BOOK_COLUMNS \
+    "b.book_id,b.book_key,b.title,b.sort_title," \
     "COALESCE(a.display_name,''),COALESCE(b.narrator,'')," \
     "COALESCE(s.display_name,''),COALESCE(b.series_number,0)," \
     "b.root_path,COALESCE(b.cover_path,''),COALESCE(b.cover_cache_path,'')," \
     "b.total_duration_ms,b.track_count,COALESCE(b.fingerprint,'')," \
     "COALESCE(b.date_added,0),COALESCE(b.date_modified,0)," \
     "COALESCE(b.last_played_at,0),b.completed,COALESCE(b.completed_at,0)," \
-    "b.playback_speed " \
+    "b.playback_speed,b.kind "
+
+#define SQL_JOIN_AUTHOR_SERIES \
     "FROM books b LEFT JOIN authors a ON a.author_id=b.author_id " \
-    "LEFT JOIN series s ON s.series_id=b.series_id WHERE b.book_key=?"
+    "LEFT JOIN series s ON s.series_id=b.series_id "
+
+#define SQL_GET_BOOK_BY_KEY \
+    "SELECT " SQL_BOOK_COLUMNS SQL_JOIN_AUTHOR_SERIES "WHERE b.book_key=?"
 
 #define SQL_GET_BOOK_BY_ID \
-    "SELECT b.book_id,b.book_key,b.title,b.sort_title," \
-    "COALESCE(a.display_name,''),COALESCE(b.narrator,'')," \
-    "COALESCE(s.display_name,''),COALESCE(b.series_number,0)," \
-    "b.root_path,COALESCE(b.cover_path,''),COALESCE(b.cover_cache_path,'')," \
-    "b.total_duration_ms,b.track_count,COALESCE(b.fingerprint,'')," \
-    "COALESCE(b.date_added,0),COALESCE(b.date_modified,0)," \
-    "COALESCE(b.last_played_at,0),b.completed,COALESCE(b.completed_at,0)," \
-    "b.playback_speed " \
-    "FROM books b LEFT JOIN authors a ON a.author_id=b.author_id " \
-    "LEFT JOIN series s ON s.series_id=b.series_id WHERE b.book_id=?"
+    "SELECT " SQL_BOOK_COLUMNS SQL_JOIN_AUTHOR_SERIES "WHERE b.book_id=?"
 
 #define SQL_LIST_BOOKS \
-    "SELECT b.book_id,b.book_key,b.title,b.sort_title," \
-    "COALESCE(a.display_name,''),COALESCE(b.narrator,'')," \
-    "COALESCE(s.display_name,''),COALESCE(b.series_number,0)," \
-    "b.root_path,COALESCE(b.cover_path,''),COALESCE(b.cover_cache_path,'')," \
-    "b.total_duration_ms,b.track_count,COALESCE(b.fingerprint,'')," \
-    "COALESCE(b.date_added,0),COALESCE(b.date_modified,0)," \
-    "COALESCE(b.last_played_at,0),b.completed,COALESCE(b.completed_at,0)," \
-    "b.playback_speed " \
-    "FROM books b LEFT JOIN authors a ON a.author_id=b.author_id " \
-    "LEFT JOIN series s ON s.series_id=b.series_id " \
-    "ORDER BY b.sort_title COLLATE NOCASE"
+    "SELECT " SQL_BOOK_COLUMNS SQL_JOIN_AUTHOR_SERIES \
+    "WHERE b.kind=0 ORDER BY b.sort_title COLLATE NOCASE"
 
+/* Continue Listening deliberately spans both kinds: a part-listened podcast
+ * episode belongs in "resume what I was doing" just as much as a book. */
 #define SQL_LIST_CONTINUE \
-    "SELECT b.book_id,b.book_key,b.title,b.sort_title," \
-    "COALESCE(a.display_name,''),COALESCE(b.narrator,'')," \
-    "COALESCE(s.display_name,''),COALESCE(b.series_number,0)," \
-    "b.root_path,COALESCE(b.cover_path,''),COALESCE(b.cover_cache_path,'')," \
-    "b.total_duration_ms,b.track_count,COALESCE(b.fingerprint,'')," \
-    "COALESCE(b.date_added,0),COALESCE(b.date_modified,0)," \
-    "COALESCE(b.last_played_at,0),b.completed,COALESCE(b.completed_at,0)," \
-    "b.playback_speed " \
+    "SELECT " SQL_BOOK_COLUMNS \
     "FROM books b INNER JOIN progress p ON p.book_id=b.book_id " \
     "LEFT JOIN authors a ON a.author_id=b.author_id " \
     "LEFT JOIN series s ON s.series_id=b.series_id " \
     "WHERE p.completed=0 AND p.last_played_at>0 " \
     "ORDER BY p.last_played_at DESC"
 
+/* Reads p.completed, not b.completed: nothing in the codebase ever sets
+ * books.completed, so the old b.completed=1 filter could never match. */
 #define SQL_LIST_FINISHED \
-    "SELECT b.book_id,b.book_key,b.title,b.sort_title," \
-    "COALESCE(a.display_name,''),COALESCE(b.narrator,'')," \
-    "COALESCE(s.display_name,''),COALESCE(b.series_number,0)," \
-    "b.root_path,COALESCE(b.cover_path,''),COALESCE(b.cover_cache_path,'')," \
-    "b.total_duration_ms,b.track_count,COALESCE(b.fingerprint,'')," \
-    "COALESCE(b.date_added,0),COALESCE(b.date_modified,0)," \
-    "COALESCE(b.last_played_at,0),b.completed,COALESCE(b.completed_at,0)," \
-    "b.playback_speed " \
-    "FROM books b LEFT JOIN authors a ON a.author_id=b.author_id " \
+    "SELECT " SQL_BOOK_COLUMNS \
+    "FROM books b INNER JOIN progress p ON p.book_id=b.book_id " \
+    "LEFT JOIN authors a ON a.author_id=b.author_id " \
     "LEFT JOIN series s ON s.series_id=b.series_id " \
-    "WHERE b.completed=1 ORDER BY b.completed_at DESC"
+    "WHERE p.completed=1 AND b.kind=0 ORDER BY p.completed_at DESC"
 
 #define SQL_LIST_AUTHORS \
     "SELECT DISTINCT COALESCE(a.display_name,'') FROM books b " \
     "LEFT JOIN authors a ON a.author_id=b.author_id " \
     "WHERE a.display_name IS NOT NULL AND a.display_name<>'' " \
+    "AND b.kind=0 " \
     "ORDER BY a.display_name COLLATE NOCASE"
 
 #define SQL_LIST_BOOKS_BY_AUTHOR \
-    "SELECT b.book_id,b.book_key,b.title,b.sort_title," \
-    "COALESCE(a.display_name,''),COALESCE(b.narrator,'')," \
-    "COALESCE(s.display_name,''),COALESCE(b.series_number,0)," \
-    "b.root_path,COALESCE(b.cover_path,''),COALESCE(b.cover_cache_path,'')," \
-    "b.total_duration_ms,b.track_count,COALESCE(b.fingerprint,'')," \
-    "COALESCE(b.date_added,0),COALESCE(b.date_modified,0)," \
-    "COALESCE(b.last_played_at,0),b.completed,COALESCE(b.completed_at,0)," \
-    "b.playback_speed " \
+    "SELECT " SQL_BOOK_COLUMNS \
     "FROM books b INNER JOIN authors a ON a.author_id=b.author_id " \
     "LEFT JOIN series s ON s.series_id=b.series_id " \
-    "WHERE a.display_name=? " \
+    "WHERE a.display_name=? AND b.kind=0 " \
     "ORDER BY b.series_number, b.sort_title COLLATE NOCASE"
 
 #define SQL_LIST_BOOKS_BY_SERIES \
-    "SELECT b.book_id,b.book_key,b.title,b.sort_title," \
-    "COALESCE(a.display_name,''),COALESCE(b.narrator,'')," \
-    "COALESCE(s.display_name,''),COALESCE(b.series_number,0)," \
-    "b.root_path,COALESCE(b.cover_path,''),COALESCE(b.cover_cache_path,'')," \
-    "b.total_duration_ms,b.track_count,COALESCE(b.fingerprint,'')," \
-    "COALESCE(b.date_added,0),COALESCE(b.date_modified,0)," \
-    "COALESCE(b.last_played_at,0),b.completed,COALESCE(b.completed_at,0)," \
-    "b.playback_speed " \
+    "SELECT " SQL_BOOK_COLUMNS \
     "FROM books b INNER JOIN series s ON s.series_id=b.series_id " \
     "LEFT JOIN authors a ON a.author_id=b.author_id " \
-    "WHERE s.display_name=? " \
+    "WHERE s.display_name=? AND b.kind=0 " \
     "ORDER BY b.series_number, b.sort_title COLLATE NOCASE"
 
 #define SQL_LIST_SERIES \
     "SELECT DISTINCT COALESCE(s.display_name,'') FROM books b " \
     "LEFT JOIN series s ON s.series_id=b.series_id " \
     "WHERE s.display_name IS NOT NULL AND s.display_name<>'' " \
+    "AND b.kind=0 " \
     "ORDER BY s.display_name COLLATE NOCASE"
+
+/* Podcast shows are series rows carrying kind=1 books. */
+#define SQL_LIST_SHOWS \
+    "SELECT DISTINCT COALESCE(s.display_name,'') FROM books b " \
+    "INNER JOIN series s ON s.series_id=b.series_id " \
+    "WHERE s.display_name IS NOT NULL AND s.display_name<>'' " \
+    "AND b.kind=1 " \
+    "ORDER BY s.display_name COLLATE NOCASE"
+
+/* series_number is the episode's index in the scanner's natural filename sort,
+ * so DESC is reverse filename order. That matches newest-first only for
+ * date-prefixed or numbered filenames. */
+#define SQL_LIST_EPISODES_BY_SHOW \
+    "SELECT " SQL_BOOK_COLUMNS \
+    "FROM books b INNER JOIN series s ON s.series_id=b.series_id " \
+    "LEFT JOIN authors a ON a.author_id=b.author_id " \
+    "WHERE s.display_name=? AND b.kind=1 " \
+    "ORDER BY b.series_number DESC, b.sort_title COLLATE NOCASE DESC"
 
 #define SQL_LIST_FOLDERS \
     "SELECT DISTINCT COALESCE(root_path,'') FROM books " \
     "WHERE root_path IS NOT NULL AND root_path<>'' " \
+    "AND kind=0 " \
     "ORDER BY root_path COLLATE NOCASE"
 
 #define SQL_GET_TRACKS \
@@ -358,6 +360,7 @@ static int fill_book_from_stmt(sqlite3_stmt *stmt, audiobook_book_t *b) {
     b->completed = sqlite3_column_int(stmt, 17);
     b->completed_at = sqlite3_column_int(stmt, 18);
     b->playback_speed = sqlite3_column_double(stmt, 19);
+    b->kind = sqlite3_column_int(stmt, 20);
     return 1;
 }
 
@@ -524,6 +527,12 @@ int audiobook_db_open(const char *db_path, sqlite3 **db_out) {
         sqlite3_close(db);
         return -1;
     }
+
+    /* Additive migrations for DBs from an older build. Failure is expected and
+     * ignored: "duplicate column name" just means this DB already has it. */
+    for (size_t i = 0;
+         i < sizeof(MIGRATION_SQL) / sizeof(MIGRATION_SQL[0]); i++)
+        sqlite3_exec(db, MIGRATION_SQL[i], NULL, NULL, NULL);
 
     /* Set schema version */
     char ver_sql[128];
@@ -707,6 +716,20 @@ int audiobook_list_books_by_series(sqlite3 *db, const char *series,
                                               void *ctx),
                                     void *ctx) {
     return list_books_generic_bind(db, SQL_LIST_BOOKS_BY_SERIES, series,
+                                   cb, ctx);
+}
+
+int audiobook_list_shows(sqlite3 *db,
+                         int (*cb)(const char *show, void *ctx),
+                         void *ctx) {
+    return list_strings_generic(db, SQL_LIST_SHOWS, cb, ctx);
+}
+
+int audiobook_list_episodes_by_show(sqlite3 *db, const char *show,
+                                    int (*cb)(const audiobook_book_t *book,
+                                              void *ctx),
+                                    void *ctx) {
+    return list_books_generic_bind(db, SQL_LIST_EPISODES_BY_SHOW, show,
                                    cb, ctx);
 }
 

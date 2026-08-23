@@ -28,9 +28,22 @@
 #define AUDIOBOOK_COVER_CACHE   "/usr/data/audiobooks/cache/covers"
 #define AUDIOBOOK_RUN_DIR       "/usr/data/audiobooks/run"
 #define AUDIOBOOK_LIBRARY_ROOT  "/usr/data/mnt/sd_0/Audiobooks"
-#define SCHEMA_VERSION          "2"
+/* Podcast episodes live in a sibling root, not nested under /Audiobooks: the
+ * audiobook scanner would otherwise have to permanently exclude one magic
+ * subfolder name, swallowing a real audiobook folder called "Podcasts". Keep
+ * in sync with APP_PATH_SQL in music_catalog.c. */
+#define AUDIOBOOK_PODCAST_ROOT  "/usr/data/mnt/sd_0/Podcasts"
+#define SCHEMA_VERSION          "3"
 
 /* ---- Types -------------------------------------------------------------- */
+
+/* What a books row represents. A podcast episode is its own row (one track)
+ * rather than a track of a show, because progress is keyed book_id PRIMARY KEY
+ * so one row = one resume point. */
+typedef enum {
+    LIB_KIND_BOOK    = 0,
+    LIB_KIND_PODCAST = 1,
+} lib_kind_t;
 
 typedef struct {
     int book_id;
@@ -53,6 +66,7 @@ typedef struct {
     int completed;
     int completed_at;
     double playback_speed;
+    int kind;               /* lib_kind_t */
 } audiobook_book_t;
 
 typedef struct {
@@ -165,6 +179,22 @@ int audiobook_list_authors(sqlite3 *db,
 int audiobook_list_series(sqlite3 *db,
                          int (*cb)(const char *series, void *ctx),
                          void *ctx);
+
+/* List distinct podcast show names. Shows are stored as `series` rows; the
+ * kind filter keeps book series and podcast shows in separate views even when
+ * they share a name (series.display_name is UNIQUE, so they share the row).
+ * Returns count or -1. */
+int audiobook_list_shows(sqlite3 *db,
+                         int (*cb)(const char *show, void *ctx),
+                         void *ctx);
+
+/* List a show's episodes, newest-looking first. Ordered by series_number DESC,
+ * which is the reverse of the scanner's natural filename sort — see the
+ * ordering caveats in docs/plans. Returns count or -1. */
+int audiobook_list_episodes_by_show(sqlite3 *db, const char *show,
+                                    int (*cb)(const audiobook_book_t *book,
+                                              void *ctx),
+                                    void *ctx);
 
 /* List distinct root_paths (folders). Returns count or -1. */
 int audiobook_list_folders(sqlite3 *db,
