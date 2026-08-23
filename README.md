@@ -204,7 +204,38 @@ HIBY_ABS_URL=http://other-host:13378/audiobookshelf
 HIBY_ABS_LIBRARY_ID=...
 HIBY_ABS_BOOK_LIBRARY_ID=...
 HIBY_ABS_DIRECTION=push
+HIBY_ABS_HC_URL=https://hc-ping.com/YOUR-UUID
 ```
+
+**Watching it without tailing the log.** Set `HIBY_ABS_HC_URL` to a
+[healthchecks.io](https://healthchecks.io) ping URL and every run reports
+itself there: a start ping, then success or failure with that run's log as the
+ping body, browsable per run in the check's Events tab. Unset, nothing is
+pinged and the wrapper behaves exactly as before.
+
+The wrapper still exits 0 whatever happens, so a failed reconcile cannot block
+a ChronoSync sync; the true status goes to healthchecks instead. A run counts
+as failed if the sync script errors, an item fails to reach ABS, or the card is
+not mounted, and also if the run skipped entirely for want of `python3`, the
+script or the token, which is otherwise the easiest thing to not notice.
+
+Because syncing is on demand rather than scheduled, there is no meaningful
+period to expect. Set the check's period long (a week, say) so it goes red only
+if you have not synced in ages, and rely on failure pings for the real
+alerting: those fire immediately, whatever the schedule says. Grace time is
+worth a thought too: with a start ping being sent, it doubles as how long a run
+may take before healthchecks gives up on it, so leave room for a first sync
+against a slow ABS.
+
+A ping body is that run's log, so episode and book titles and their paths on
+the card go to healthchecks. If you would rather they did not, point
+`HIBY_ABS_HC_URL` at a check and change the wrapper's final ping to
+`"$HC_URL/log"`, which records nothing about state, or drop the body.
+
+Check it works once, since nothing else will tell you: with the URL in place
+run `HIBY_ABS_DRY_RUN=1 bash tools/chronosync_presync_abs.sh` and look for the
+run under the check's Events, log attached. A ping that fails to send is
+reported in `~/Library/Logs/hiby-abs-sync.log`.
 
 ### macOS / Linux
 

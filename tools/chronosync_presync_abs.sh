@@ -25,6 +25,7 @@
 #   2. optionally override the defaults in ~/.config/abs/config, e.g.
 #        HIBY_ABS_URL=http://seans-imac.local:13378/audiobookshelf
 #        HIBY_ABS_LIBRARY_ID=e92e1153-f83a-4a6a-a3f6-235758222e67
+#        HIBY_ABS_HC_URL=https://hc-ping.com/<uuid>
 #   3. in the ChronoSync document: Options -> Scripts -> "Run script before
 #      synchronize", pointing at this file
 #
@@ -62,6 +63,15 @@ PYTHON="/usr/bin/python3"
 LOG="${HIBY_ABS_LOG:-$HOME/Library/Logs/hiby-abs-sync.log}"
 MAX_LOG_BYTES=1048576
 
+# Optional healthchecks.io ping URL. Machine-specific, so it belongs in the
+# config file; unset means no pinging. Each run then reports its status and
+# posts its log there, so checking on a sync does not mean tailing this file.
+HC_URL="${HIBY_ABS_HC_URL:-}"
+HC_URL="${HC_URL%/}"  # pasted by hand; a trailing slash 404s every ping
+# healthchecks.io keeps the FIRST 100kB of a ping body and our summary is at
+# the end, so trim from the front ourselves.
+MAX_PING_BYTES=100000
+
 mkdir -p "$(dirname "$LOG")" 2>/dev/null
 
 if [ -f "$LOG" ]; then
@@ -70,6 +80,11 @@ if [ -f "$LOG" ]; then
     mv -f "$LOG" "$LOG.1" 2>/dev/null
   fi
 fi
+
+# This run's output on its own, for the ping body. $LOG stays the rolling
+# history. Not a subshell, so rc set inside the group survives it.
+RUN_LOG="$(mktemp -t hiby-abs-sync)"
+rc=0
 
 {
   # Record which commit produced this run. After a git pull, the log is then
@@ -81,12 +96,24 @@ fi
   git -C "$TOOLS" diff --quiet -- "$TOOLS" 2>/dev/null || dirty="+local-changes"
   echo "=== $(date '+%Y-%m-%d %H:%M:%S') pre-sync on $(hostname -s)" \
        "[$rev$dirty] ==="
+  # "started", so a run that dies before reporting back shows up as such and
+  # the duration gets measured. No --retry: losing this only costs the
+  # duration, and ChronoSync is waiting on us.
+  if [ -n "$HC_URL" ]; then
+    curl -fsS -m 5 -o /dev/null "$HC_URL/start" \
+      || echo "(healthchecks start ping failed)"
+  fi
+  # Every skip below is a misconfiguration that silently stops state syncing,
+  # which is the main thing worth being told about, so each one fails the check.
   if [ -z "${PYTHON:-}" ] || [ ! -x "$PYTHON" ]; then
     echo "no python3 found; skipping"
+    rc=1
   elif [ ! -f "$SCRIPT" ]; then
     echo "sync script not found at $SCRIPT; skipping"
+    rc=1
   elif [ ! -f "$TOKEN_FILE" ]; then
     echo "no ABS token at $TOKEN_FILE; skipping"
+    rc=1
   else
     extra=""
     if [ "${HIBY_ABS_DRY_RUN:-0}" = "1" ]; then
@@ -101,9 +128,29 @@ fi
       $book_arg \
       --direction "$DIRECTION" \
       --token-file "$TOKEN_FILE" \
+      --strict \
       $extra 2>&1
-    echo "(script exit: $?)"
+    rc=$?
+    echo "(script exit: $rc)"
   fi
-} >>"$LOG" 2>&1
+} >"$RUN_LOG" 2>&1
 
+cat "$RUN_LOG" >>"$LOG"
+
+# Exit code in the path sets the check's state, body is the run's log, both
+# visible per run in the healthchecks UI. Body from a file, not a pipe: curl
+# cannot replay stdin on --retry.
+# --strict makes an unmounted card a failure. If that turns out to be routine
+# enough to start ignoring the check, POST to "$HC_URL/log" instead for that
+# case: it records the body without touching the check's state.
+if [ -n "$HC_URL" ]; then
+  tail -c "$MAX_PING_BYTES" "$RUN_LOG" >"$RUN_LOG.body"
+  curl -fsS -m 10 --retry 2 --retry-max-time 20 -o /dev/null \
+    --data-binary "@$RUN_LOG.body" "$HC_URL/$rc" 2>>"$LOG" \
+    || echo "(healthchecks ping failed; status $rc not reported)" >>"$LOG"
+fi
+
+rm -f "$RUN_LOG" "$RUN_LOG.body"
+
+# Always 0: see the header. $rc went to healthchecks, not to ChronoSync.
 exit 0
