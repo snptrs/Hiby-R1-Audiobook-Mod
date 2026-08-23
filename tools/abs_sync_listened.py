@@ -922,17 +922,24 @@ def run_mirror_repair(args, card, device) -> None:
 
 
 if __name__ == "__main__":
-    # The exit-0 guard exists so an unattended ChronoSync pre-sync failure
-    # cannot block a sync. It must NOT apply to --check, an interactive
-    # diagnostic whose whole job is to report failure.
+    # The exit-0 guard is a second line of defence against an unattended
+    # ChronoSync pre-sync failure blocking a sync (the wrapper's own exit 0 is
+    # the first). It must NOT apply to --check or --strict, whose callers want
+    # the failure reported: an interactive diagnostic and the wrapper's
+    # healthchecks ping respectively.
     _report = ("--strict" in sys.argv) or ("--check" in sys.argv)
     try:
         rc = main()
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else 1
-        if code and not _report:
-            log(f"error (suppressed, no --strict): {exc}")
-            code = 0
+        if code:
+            # We swallow the SystemExit, so Python never prints its message.
+            # Log it or a --strict run reports failure with no reason given.
+            reason = exc.code if isinstance(exc.code, str) else f"exit {code}"
+            log(f"error{'' if _report else ' (suppressed, no --strict)'}: "
+                f"{reason}")
+            if not _report:
+                code = 0
         rc = code
     except Exception as exc:  # never take a ChronoSync sync down with us
         log(f"unexpected error: {exc!r}")
