@@ -128,11 +128,12 @@ typedef struct {
     uint64_t avrcp_next_open_ms;
 
     /* Screen blank (power button). Lightweight: backlight off only — we keep
-     * panning so the touch IC stays alive (enables double-tap wake) and the
-     * decode thread keeps running (audiobook plays with the screen dark). */
+     * panning so the touch controller and display loop stay alive and the decode
+     * thread keeps running (audiobook plays with the screen dark). The
+     * touchscreen does NOT wake: only the power button and other hardware keys
+     * do, so a pocket brush cannot light the screen up mid-listen. */
     int blanked;             /* 1 = screen blanked (backlight off) */
     int saved_brightness;    /* brightness to restore on wake */
-    uint64_t last_touch_up_ms; /* for double-tap-to-wake while blanked */
 
     ui_screen_t screen;
     list_mode_t list_mode;

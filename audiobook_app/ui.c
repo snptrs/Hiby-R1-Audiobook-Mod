@@ -609,8 +609,8 @@ static int framebuffer_unblank(int fb_fd) {
 }
 
 /* Lightweight blank: backlight off only. We keep panning (touch IC stays
- * alive → double-tap wake works) and the decode thread runs (audiobook plays
- * with the screen dark). Wake on power press or touchscreen double-tap. */
+ * alive) and the decode thread runs (audiobook plays with the screen dark).
+ * Wake on a power press or any other hardware key; NOT on touch. */
 static void set_blanked(ui_state_t *ui, int on, int fb_fd) {
     if (on) {
         int was_blanked = ui->blanked;
@@ -624,7 +624,6 @@ static void set_blanked(ui_state_t *ui, int on, int fb_fd) {
         write_backlight_power(FB_BLANK_UNBLANK);
         write_brightness(0);
         ui->blanked = 1;
-        ui->last_touch_up_ms = 0;
         if (!was_blanked)
             ui_log("[ui] BLANK on (saved brightness=%d fb_unblank=%d)\n",
                    ui->saved_brightness, fb_rc);
@@ -1066,24 +1065,19 @@ int ui_run(uint16_t *fb, int fb_fd) {
                 struct input_event ev;
                 while (read(ui->input_fd, &ev, sizeof(ev)) == sizeof(ev)) {
                     if (ui->blanked) {
-                        /* While blanked, don't navigate on taps; watch for a
-                         * double-tap (two finger-ups within 350ms) to wake. */
-                        int is_up = 0;
-                        if (ev.type == EV_ABS && ev.code == ABS_PRESSURE
-                            && ev.value == 0) is_up = 1;
-                        else if (ev.type == EV_KEY && ev.code == 0x14a
-                                 && ev.value == 0) is_up = 1;
-                        if (is_up) {
-                            uint64_t now = now_ms();
-                            if (ui->last_touch_up_ms != 0
-                                && (now - ui->last_touch_up_ms) < 350) {
-                                ui_log("[ui] double-tap wake\n");
-                                set_blanked(ui, 0, fb_fd);
-                                ui->last_touch_up_ms = 0;
-                            } else {
-                                ui->last_touch_up_ms = now;
-                            }
-                        }
+                        /* Screen off: the touchscreen does nothing at all, not
+                         * even wake. The blank is backlight-only so the touch
+                         * controller stays powered, which makes a wake gesture
+                         * technically possible, but it also means anything
+                         * brushing the screen in a pocket would light it up and
+                         * burn battery mid-listen. Wake is the power button's
+                         * job (and any other hardware key, handled below).
+                         *
+                         * Events are still READ and discarded rather than left
+                         * unread: the fd is level-triggered, so ignoring it
+                         * would spin the select loop and the queued events
+                         * would then replay as navigation on the next wake. */
+                        (void)ev;
                     } else {
                         process_touch_event(ui, &ev);
                     }
@@ -1180,7 +1174,7 @@ int ui_run(uint16_t *fb, int fb_fd) {
         /* Drive the pan loop to keep the display + touch IC alive and
          * show our UI. Our ioctl hook draws before the real pan.
          * Keep panning even when blanked (backlight off) so the touch IC
-         * stays alive for double-tap wake. */
+         * stays alive. */
         now = now_ms();
         volume_hold_tick(ui, now);
         if (can_pan && (now - last_pan) >= PAN_INTERVAL_MS) {
@@ -1191,7 +1185,7 @@ int ui_run(uint16_t *fb, int fb_fd) {
                 && errno == EBUSY) {
                 /* A hard FBIOBLANK makes pan return EBUSY while brightness
                  * may still report a nonzero value. Convert it to our
-                 * lightweight blank so the next power press or double-tap
+                 * lightweight blank so the next power press or hardware key
                  * reliably wakes the panel. */
                 ui_log("[ui] hard blank detected from pan EBUSY\n");
                 set_blanked(ui, 1, fb_fd);

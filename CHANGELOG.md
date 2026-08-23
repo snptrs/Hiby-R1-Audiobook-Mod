@@ -4,6 +4,16 @@ All public releases are for the normal HiBy R1 on stock firmware 1.6. Do not ins
 
 ## Unreleased - podcast support
 
+### Changed: the touchscreen no longer wakes a blanked screen
+
+Only the power button (and any other hardware key) wakes it now. The blank is
+backlight-only so the touch controller stays powered, which is what made a wake
+gesture possible in the first place, but it also meant anything brushing the
+screen in a pocket lit it up and burned battery mid-listen. Touch events while
+blanked are still read and discarded rather than left unread: the fd is
+level-triggered, so ignoring it would spin the event loop and the queued events
+would replay as navigation on the next wake.
+
 ### Fixed: deleting a played item left it visible in the library
 
 `progress.track_id` and `bookmarks.track_id` reference `tracks` with no
