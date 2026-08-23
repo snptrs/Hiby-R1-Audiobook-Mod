@@ -125,11 +125,20 @@ def read_library(card: Path) -> list[dict]:
             books = con.execute(
                 "SELECT book_id, kind, root_path, track_count FROM books"
             ).fetchall()
-            tracks: dict[int, list[tuple[int, str, int]]] = {}
-            for bid, ordinal, path, dur in con.execute(
-                    "SELECT book_id, ordinal, path, duration_ms FROM tracks "
+            db_prog = {
+                bid: {"completed": bool(comp),
+                      "book_elapsed_ms": elapsed or 0}
+                for bid, comp, elapsed in con.execute(
+                    "SELECT book_id, completed, total_book_elapsed_ms "
+                    "FROM progress")}
+            tracks: dict[int, list[dict]] = {}
+            for bid, tid, ordinal, path, dur in con.execute(
+                    "SELECT book_id, track_id, ordinal, path, duration_ms "
+                    "FROM tracks "
                     "ORDER BY book_id, disc_number, track_number, ordinal"):
-                tracks.setdefault(bid, []).append((ordinal, path, dur or 0))
+                tracks.setdefault(bid, []).append(
+                    {"track_id": tid, "ordinal": ordinal, "path": path,
+                     "duration_ms": dur or 0})
         finally:
             con.close()
     out = []
@@ -138,7 +147,8 @@ def read_library(card: Path) -> list[dict]:
         if not tl:
             continue
         out.append({"book_id": bid, "kind": kind, "root_path": root,
-                    "track_count": tc, "tracks": tl})
+                    "track_count": tc, "tracks": tl,
+                    "db_progress": db_prog.get(bid)})
     return out
 
 
@@ -182,18 +192,53 @@ def write_pos(card: Path, book_id: int, ordinal: int, track_pos_ms: int,
     os.replace(tmp, d / f"{book_id}.pos")
 
 
-def split_position(tracks: list[tuple[int, str, int]],
-                   book_elapsed_ms: int) -> tuple[int, int]:
-    """Book-relative ms -> (track_ordinal, ms within that track).
+# Mirrors SQL_SAVE_PROGRESS in library.c. The .pos file is authoritative for
+# RESUME, but the list UI reads progress rows via audiobook_get_progress, so a
+# pull that writes only .pos resumes correctly and shows no Played badge.
+SQL_UPSERT_PROGRESS = (
+    "INSERT INTO progress(book_id,track_id,track_ordinal,position_ms,"
+    "total_book_elapsed_ms,playback_speed,last_played_at,completed,"
+    "completed_at,last_saved_at,protected_until_ms) "
+    "VALUES(?,?,?,?,?,1.0,?,?,?,?,0) ON CONFLICT(book_id) DO UPDATE SET "
+    "track_id=excluded.track_id,track_ordinal=excluded.track_ordinal,"
+    "position_ms=excluded.position_ms,"
+    "total_book_elapsed_ms=excluded.total_book_elapsed_ms,"
+    "last_played_at=excluded.last_played_at,completed=excluded.completed,"
+    "completed_at=excluded.completed_at,last_saved_at=excluded.last_saved_at")
+
+
+def write_progress_db(card: Path, book_id: int, track_id: int | None,
+                      ordinal: int, position_ms: int, book_elapsed_ms: int,
+                      completed: bool, when: int) -> None:
+    """Upsert the library.db progress row the device's list views read.
+
+    Best-effort by design: the caller keeps the .pos write even if this fails,
+    since .pos is what playback resumes from. Safe to write with the device
+    powered off, and the schema uses journal_mode=DELETE so there is no WAL to
+    leave behind.
+    """
+    con = sqlite3.connect(card / DB_RELPATH, timeout=10)
+    try:
+        con.execute(SQL_UPSERT_PROGRESS,
+                    (book_id, track_id, ordinal, position_ms, book_elapsed_ms,
+                     when, 1 if completed else 0, when if completed else 0,
+                     when))
+        con.commit()
+    finally:
+        con.close()
+
+
+def split_position(tracks: list[dict], book_elapsed_ms: int) -> tuple[dict, int]:
+    """Book-relative ms -> (track, ms within that track).
 
     Mirrors the accumulate-durations walk the player itself does in cmd_seek.
     """
     acc = 0
-    for ordinal, _path, dur in tracks:
-        if book_elapsed_ms < acc + dur or (ordinal, _path, dur) == tracks[-1]:
-            return ordinal, max(0, book_elapsed_ms - acc)
-        acc += dur
-    return (tracks[0][0] if tracks else 1), max(0, book_elapsed_ms)
+    for i, t in enumerate(tracks):
+        if book_elapsed_ms < acc + t["duration_ms"] or i == len(tracks) - 1:
+            return t, max(0, book_elapsed_ms - acc)
+        acc += t["duration_ms"]
+    return {"ordinal": 1, "track_id": None}, max(0, book_elapsed_ms)
 
 
 def collect_device_state(card: Path, kinds: set[int]) -> dict[str, dict]:
@@ -206,7 +251,7 @@ def collect_device_state(card: Path, kinds: set[int]) -> dict[str, dict]:
         prefix = root.rstrip("/") + "/"
         # A podcast episode is keyed on its FILE, a book on its FOLDER, which is
         # what makes each match the corresponding ABS relPath.
-        raw = (row["tracks"][0][1] if row["kind"] == KIND_PODCAST
+        raw = (row["tracks"][0]["path"] if row["kind"] == KIND_PODCAST
                else row["root_path"])
         if not raw.startswith(prefix):
             continue
@@ -215,8 +260,8 @@ def collect_device_state(card: Path, kinds: set[int]) -> dict[str, dict]:
         out[norm(rel)] = {
             "rel": rel, "book_id": row["book_id"], "kind": row["kind"],
             "tracks": row["tracks"],
-            "device_total_ms": sum(t[2] for t in row["tracks"]),
-            "pos": pos,
+            "device_total_ms": sum(t["duration_ms"] for t in row["tracks"]),
+            "pos": pos, "db_progress": row["db_progress"],
         }
     return out
 
@@ -503,9 +548,10 @@ def reconcile(device: dict[str, dict], targets: dict[str, dict],
             # let the completed flag stand: the player restarts a finished item
             # from the beginning anyway.
             elapsed_ms = 0 if abs_fin else int(round(abs_secs * 1000))
-            ordinal, within = split_position(dev["tracks"], elapsed_ms)
+            track, within = split_position(dev["tracks"], elapsed_ms)
             actions.append(("pull", dev, tgt, {
-                "ordinal": ordinal, "track_pos_ms": within,
+                "ordinal": track["ordinal"], "track_id": track.get("track_id"),
+                "track_pos_ms": within,
                 "book_elapsed_ms": elapsed_ms, "completed": abs_fin,
                 # Carry ABS's own timestamp so the file does not look newer
                 # than the state it came from.
@@ -517,6 +563,49 @@ def reconcile(device: dict[str, dict], targets: dict[str, dict],
 
 
 # ----------------------------------------------------------------------- main
+
+
+def repair_db_mirror(card: Path, device: dict[str, dict],
+                     dry_run: bool) -> list[str]:
+    """Make each library.db progress row agree with its .pos file.
+
+    .pos is authoritative, but the list UI reads progress rows, so the two must
+    agree for played state and progress bars to show. They can diverge two ways:
+    the device mirrors .pos into the DB only once a minute, and an earlier
+    version of this script pulled by writing .pos alone, leaving items that
+    resume correctly while showing nothing in the UI.
+
+    Writing the DB to match .pos is always safe: .pos is the newer, canonical
+    copy by construction.
+    """
+    fixed = []
+    for dev in sorted(device.values(), key=lambda d: d["rel"]):
+        pos = dev["pos"]
+        if not pos:
+            continue
+        cur = dev.get("db_progress")
+        same = (cur is not None
+                and cur["completed"] == pos["completed"]
+                and abs(cur["book_elapsed_ms"] - pos["book_elapsed_ms"]) <= 1000)
+        if same:
+            continue
+        was = ("no row" if cur is None
+               else f"{cur['book_elapsed_ms'] // 1000}s"
+                    f"{' played' if cur['completed'] else ''}")
+        now = (f"{pos['book_elapsed_ms'] // 1000}s"
+               f"{' played' if pos['completed'] else ''}")
+        fixed.append(f"{dev['rel']}: db progress {was} -> {now}")
+        if dry_run:
+            continue
+        track, within = split_position(dev["tracks"], pos["book_elapsed_ms"])
+        try:
+            write_progress_db(card, dev["book_id"], track.get("track_id"),
+                              pos["track_ordinal"] or track["ordinal"],
+                              pos["track_pos_ms"], pos["book_elapsed_ms"],
+                              pos["completed"], pos["saved_at"])
+        except (sqlite3.Error, OSError) as exc:
+            fixed[-1] += f" (FAILED: {exc})"
+    return fixed
 
 
 def plan(args, device: dict[str, dict], targets: dict[str, dict],
@@ -762,7 +851,10 @@ def main() -> int:
         log(f"  skip: {msg}")
     if not actions:
         log("nothing to update")
+        run_mirror_repair(args, card, device)
         return 0
+
+    run_mirror_repair(args, card, device)
 
     sent = failed = 0
     for kind, dev, tgt, payload in actions:
@@ -787,6 +879,17 @@ def main() -> int:
                 write_pos(card, dev["book_id"], payload["ordinal"],
                           payload["track_pos_ms"], payload["book_elapsed_ms"],
                           payload["completed"], payload["saved_at"])
+                # Also the DB row, or the device resumes correctly but shows
+                # no Played badge and no progress bar.
+                try:
+                    write_progress_db(
+                        card, dev["book_id"], payload["track_id"],
+                        payload["ordinal"], payload["track_pos_ms"],
+                        payload["book_elapsed_ms"], payload["completed"],
+                        payload["saved_at"])
+                except (sqlite3.Error, OSError) as exc:
+                    log(f"       (.pos written; library.db progress row "
+                        f"failed: {exc})")
             log(f"  sent {arrow} {what:>9}  {dev['rel']}")
             sent += 1
         except (urllib.error.URLError, OSError, ValueError) as exc:
@@ -798,6 +901,14 @@ def main() -> int:
     else:
         log(f"updated {sent}, failed {failed}")
     return 1 if (failed and args.strict) else 0
+
+
+def run_mirror_repair(args, card, device) -> None:
+    if args.direction == "push":
+        return  # read-only on the card in this mode
+    fixed = repair_db_mirror(card, device, args.dry_run)
+    for msg in fixed:
+        log(f"  {'DRY  ' if args.dry_run else 'sent '} db-mirror  {msg}")
 
 
 if __name__ == "__main__":

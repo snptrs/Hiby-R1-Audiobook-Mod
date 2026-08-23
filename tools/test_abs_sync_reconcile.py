@@ -29,9 +29,16 @@ def check(label, got, want):
         fails.append(label)
 
 
+def TR(ordinal, duration_ms, track_id=None, path="x"):
+    """A track as read_library returns it. Dicts rather than tuples so adding
+    a field cannot silently shift an index."""
+    return {"ordinal": ordinal, "track_id": track_id or ordinal,
+            "path": path, "duration_ms": duration_ms}
+
+
 def dev(rel, elapsed_s=None, completed=False, when=NOW, kind=KIND_PODCAST,
         tracks=None, book_id=1):
-    tracks = tracks or [(1, f"/usr/data/mnt/sd_0/Podcasts/{rel}", 3600_000)]
+    tracks = tracks or [TR(1, 3600_000, path=f"/usr/data/mnt/sd_0/Podcasts/{rel}")]
     pos = None
     if elapsed_s is not None:
         pos = {"track_ordinal": 1, "track_pos_ms": int(elapsed_s * 1000),
@@ -39,7 +46,8 @@ def dev(rel, elapsed_s=None, completed=False, when=NOW, kind=KIND_PODCAST,
                "completed": completed, "saved_at": when}
     return {rel: {"rel": rel, "book_id": book_id, "kind": kind,
                   "tracks": tracks,
-                  "device_total_ms": sum(t[2] for t in tracks), "pos": pos}}
+                  "device_total_ms": sum(t["duration_ms"] for t in tracks),
+                  "pos": pos}}
 
 
 def tgt(rel, duration=3600.0, kind=KIND_PODCAST):
@@ -169,14 +177,15 @@ a, _, _ = run(dev("a.mp3", 50, when=NOW - 999), tgt("a.mp3"), prog(900, when=NOW
 check("can_pull=False (bad device clock) blocks the write", a, [])
 
 print("multi-file books")
-tracks = [(1, "/usr/data/mnt/sd_0/Audiobooks/A/B/1.mp3", 1000_000),
-          (2, "/usr/data/mnt/sd_0/Audiobooks/A/B/2.mp3", 1000_000),
-          (3, "/usr/data/mnt/sd_0/Audiobooks/A/B/3.mp3", 1000_000)]
+tracks = [TR(1, 1000_000, track_id=11, path="/usr/data/mnt/sd_0/Audiobooks/A/B/1.mp3"),
+          TR(2, 1000_000, track_id=12, path="/usr/data/mnt/sd_0/Audiobooks/A/B/2.mp3"),
+          TR(3, 1000_000, track_id=13, path="/usr/data/mnt/sd_0/Audiobooks/A/B/3.mp3")]
 d = dev("A/B", 1500, kind=KIND_BOOK, tracks=tracks, when=NOW - 999)
 t = tgt("A/B", duration=3000.0, kind=KIND_BOOK)
 a, _, _ = run(d, t, prog(2500, when=NOW, ep=None))
 check("pull splits a book position into track + offset",
-      [(x[3]["ordinal"], x[3]["track_pos_ms"]) for x in a], [(3, 500_000)])
+      [(x[3]["ordinal"], x[3]["track_id"], x[3]["track_pos_ms"]) for x in a],
+      [(3, 13, 500_000)])
 
 t_bad = tgt("A/B", duration=9999.0, kind=KIND_BOOK)
 a, _, s = run(d, t_bad, prog(2500, when=NOW, ep=None))
@@ -185,14 +194,16 @@ check("  and say why", "disagree on total duration" in s[0], True)
 
 check("single-file book needs no duration agreement",
       timeline_trustworthy(
-          {"kind": KIND_BOOK, "tracks": [(1, "x", 1000)],
+          {"kind": KIND_BOOK, "tracks": [TR(1, 1000)],
            "device_total_ms": 1000}, {"duration": 99999.0}), True)
 
 print("split_position")
-check("start", split_position(tracks, 0), (1, 0))
-check("inside track 2", split_position(tracks, 1_500_000), (2, 500_000))
-check("past the end clamps into the last track",
-      split_position(tracks, 9_000_000), (3, 7_000_000))
+def sp(ms):
+    t, within = split_position(tracks, ms)
+    return t["ordinal"], t["track_id"], within
+check("start", sp(0), (1, 11, 0))
+check("inside track 2", sp(1_500_000), (2, 12, 500_000))
+check("past the end clamps into the last track", sp(9_000_000), (3, 13, 7_000_000))
 
 print()
 print(f"RESULT: {'FAIL (' + str(len(fails)) + ')' if fails else 'PASS'}")

@@ -134,6 +134,12 @@ Podcasts are always included. Audiobooks are included when
 
 Behaviours worth knowing:
 
+- **The device keeps listening state in two places, and both are written.**
+  `.pos` files are authoritative for resume, but the list views read the
+  `progress` table in `library.db`, so a pull writes both. Writing only `.pos`
+  resumes correctly and shows no Played badge. A repair pass also brings any
+  `progress` row that disagrees with its `.pos` back into line, which covers the
+  device's own once-a-minute mirror lag.
 - **The more recent save wins**, comparing the device's `.pos` timestamp against
   the ABS `lastUpdate`. A pull writes ABS's timestamp into the `.pos` rather
   than the current time, so the two sides cannot ping-pong.
