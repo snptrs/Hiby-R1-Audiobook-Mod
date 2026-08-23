@@ -1668,26 +1668,43 @@ static void cmd_play(int book_id, int64_t start_ms) {
         int sd_ord = 0, sd_done = 0;
         int64_t sd_pos = 0, sd_book = 0;
         if (pos_load_sd(book_id, &sd_ord, &sd_pos, &sd_book, &sd_done) > 0) {
-            start_idx = sd_ord - 1;
-            if (start_idx < 0) start_idx = 0;
-            if (start_idx >= g_pl.track_count) start_idx = g_pl.track_count - 1;
-            into = sd_pos;
-            if (into < 0) into = 0;
-            /* Smart rewind: ease back in a few seconds before the saved spot. */
-            if (into > RESUME_REWIND_MS) into -= RESUME_REWIND_MS; else into = 0;
-            plog("resume(SD) book %d track %d @%lldms (rewound %dms)",
-                 book_id, start_idx, (long long)into, RESUME_REWIND_MS);
+            if (sd_done) {
+                /* Replaying something already finished starts it over. The
+                 * saved position sits at the very end, so resuming there would
+                 * play the last few seconds and immediately finish again. That
+                 * is a rare annoyance for a book but the normal gesture for a
+                 * played podcast episode, where it reads as broken. */
+                start_idx = 0;
+                into = 0;
+                plog("replay book %d from start (was completed)", book_id);
+            } else {
+                start_idx = sd_ord - 1;
+                if (start_idx < 0) start_idx = 0;
+                if (start_idx >= g_pl.track_count) start_idx = g_pl.track_count - 1;
+                into = sd_pos;
+                if (into < 0) into = 0;
+                /* Smart rewind: ease back in a few seconds before the saved spot. */
+                if (into > RESUME_REWIND_MS) into -= RESUME_REWIND_MS; else into = 0;
+                plog("resume(SD) book %d track %d @%lldms (rewound %dms)",
+                     book_id, start_idx, (long long)into, RESUME_REWIND_MS);
+            }
         } else {
             audiobook_progress_t p;
             if (audiobook_get_progress(g_pl.db, book_id, &p) > 0) {
-                start_idx = p.track_ordinal - 1;
-                if (start_idx < 0) start_idx = 0;
-                if (start_idx >= g_pl.track_count) start_idx = g_pl.track_count - 1;
-                into = p.position_ms;
-                if (into < 0) into = 0;
-                if (into > RESUME_REWIND_MS) into -= RESUME_REWIND_MS; else into = 0;
-                plog("resume(db) book %d track %d @%lldms (rewound %dms)",
-                     book_id, start_idx, (long long)into, RESUME_REWIND_MS);
+                if (p.completed) {
+                    start_idx = 0;
+                    into = 0;
+                    plog("replay book %d from start (db completed)", book_id);
+                } else {
+                    start_idx = p.track_ordinal - 1;
+                    if (start_idx < 0) start_idx = 0;
+                    if (start_idx >= g_pl.track_count) start_idx = g_pl.track_count - 1;
+                    into = p.position_ms;
+                    if (into < 0) into = 0;
+                    if (into > RESUME_REWIND_MS) into -= RESUME_REWIND_MS; else into = 0;
+                    plog("resume(db) book %d track %d @%lldms (rewound %dms)",
+                         book_id, start_idx, (long long)into, RESUME_REWIND_MS);
+                }
             }
         }
     } else {
@@ -2128,8 +2145,24 @@ static void *player_thread(void *arg) {
                  * looks like "the resume reset to the beginning". Saving here
                  * makes exit authoritative. Safe: save_progress no-ops when no
                  * book is loaded, and g_pl.db is still open (audiobook_db_close
-                 * runs in player_shutdown AFTER this thread exits). */
-                save_progress(0, 1);
+                 * runs in player_shutdown AFTER this thread exits).
+                 *
+                 * Skip it entirely once playback has stopped and no track is
+                 * open. That state means one of end-of-book, cmd_stop, or media
+                 * loss, and each has already saved exactly what it wanted:
+                 * end-of-book saved completed=1, cmd_stop saved completed=0,
+                 * media loss deliberately saved nothing. Saving again here with
+                 * a hardcoded 0 un-finished whatever had just been completed on
+                 * every exit, which also re-listed it in Continue Listening at
+                 * ~100%. The guards in cmd_pause (state != PLAYING) and
+                 * cmd_stop (track_open || pcm) do not cover this path.
+                 *
+                 * Not conditioned on the saved_completed shadow fields instead:
+                 * those track the last write, not the loaded book, and nothing
+                 * resets them on a book switch, so finishing A then playing 3
+                 * seconds of B and exiting would mark B completed. */
+                if (g_pl.state != PLAYER_STOPPED || g_pl.track_open)
+                    save_progress(0, 1);
                 g_pl.running = 0;
                 break;
         }
