@@ -4,6 +4,20 @@ All public releases are for the normal HiBy R1 on stock firmware 1.6. Do not ins
 
 ## Unreleased - podcast support
 
+### Fixed: deleting a played item left it visible in the library
+
+`progress.track_id` and `bookmarks.track_id` reference `tracks` with no
+`ON DELETE` action, so they default to `NO ACTION`. The orphan pass's
+`DELETE FROM tracks` therefore failed with a foreign-key violation for any
+track that had ever been played, and the step result was never checked, so the
+failure was silent: the track row survived, its book kept a track, the
+zero-track pass never fired, and the deleted item stayed in the UI permanently.
+
+Pre-existing and not podcast-specific: any audiobook you had played behaved the
+same way. Podcasts made it routine because every episode is its own book and
+episodes get deleted regularly. The references are now cleared before the
+delete, and failed steps are logged instead of ignored.
+
 Not built or flashed yet: no version marker, package name, or hashes assigned.
 Host tests pass (`tools/test_host_library_scan.sh`); the UI and player changes
 are typecheck-only so far and still need the Windows/Zig build and on-device
