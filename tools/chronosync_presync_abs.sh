@@ -13,29 +13,52 @@
 # script fails, and a transient ABS outage must not stop new episodes reaching
 # the card. Check the log if listened state stops arriving.
 #
-# ChronoSync runs scripts with a minimal environment, so everything below is an
-# absolute path and nothing depends on the working directory.
+# Needs nothing installed: abs_sync_listened.py is standard library only, so the
+# system python3 is enough. No Homebrew, no pip, no firmware build toolchain.
 #
-# Setup: in the ChronoSync document, Options -> Scripts -> "Run script before
-# synchronize", point it at this file.
+# Nothing in here is machine-specific, so the same file works on every Mac that
+# syncs to the device. Per-machine values go in the optional config file below.
+#
+# Setup:
+#   1. write the ABS API token to ~/.config/abs/token (chmod 600)
+#   2. optionally override the defaults in ~/.config/abs/config, e.g.
+#        HIBY_ABS_URL=http://seans-imac.local:13378/audiobookshelf
+#        HIBY_ABS_LIBRARY_ID=e92e1153-f83a-4a6a-a3f6-235758222e67
+#   3. in the ChronoSync document: Options -> Scripts -> "Run script before
+#      synchronize", pointing at this file
+#
+# Test it without writing anything:
+#   HIBY_ABS_DRY_RUN=1 bash tools/chronosync_presync_abs.sh
+#   tail -20 ~/Library/Logs/hiby-abs-sync.log
 
 set -u
 
-REPO="/Users/seanpeters/Code/Repos/Hiby-R1-Audiobook-Mod"
+# Resolve this script's own directory so the repo can live anywhere. ChronoSync
+# runs scripts with a minimal environment and an arbitrary working directory,
+# so nothing here may depend on either.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
+TOOLS="$(cd "$(dirname "$SELF")" && pwd)"
+SCRIPT="$TOOLS/abs_sync_listened.py"
+
+CONFIG="$HOME/.config/abs/config"
+# shellcheck source=/dev/null
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+ABS_URL="${HIBY_ABS_URL:-http://seans-imac:13378/audiobookshelf}"
+LIBRARY_ID="${HIBY_ABS_LIBRARY_ID:-e92e1153-f83a-4a6a-a3f6-235758222e67}"
+TOKEN_FILE="${HIBY_ABS_TOKEN_FILE:-$HOME/.config/abs/token}"
+
+# System python3 first: it is the one guaranteed to exist, and a Homebrew
+# upgrade cannot break the hook.
 PYTHON="/usr/bin/python3"
-SCRIPT="$REPO/tools/abs_sync_listened.py"
+[ -x "$PYTHON" ] || PYTHON="$(command -v python3 2>/dev/null)"
 
-ABS_URL="http://seans-imac:13378/audiobookshelf"
-LIBRARY_ID="e92e1153-f83a-4a6a-a3f6-235758222e67"
-TOKEN_FILE="$HOME/.config/abs/token"
-
-LOG="$HOME/Library/Logs/hiby-abs-sync.log"
+LOG="${HIBY_ABS_LOG:-$HOME/Library/Logs/hiby-abs-sync.log}"
 MAX_LOG_BYTES=1048576
 
 mkdir -p "$(dirname "$LOG")" 2>/dev/null
 
-# Keep the log from growing without bound; one rotation is plenty for a
-# per-sync script.
 if [ -f "$LOG" ]; then
   size=$(wc -c <"$LOG" 2>/dev/null | tr -d ' ')
   if [ -n "$size" ] && [ "$size" -gt "$MAX_LOG_BYTES" ]; then
@@ -44,16 +67,14 @@ if [ -f "$LOG" ]; then
 fi
 
 {
-  echo "=== $(date '+%Y-%m-%d %H:%M:%S') pre-sync ==="
-  if [ ! -x "$PYTHON" ]; then
-    echo "python3 not found at $PYTHON; skipping"
+  echo "=== $(date '+%Y-%m-%d %H:%M:%S') pre-sync on $(hostname -s) ==="
+  if [ -z "${PYTHON:-}" ] || [ ! -x "$PYTHON" ]; then
+    echo "no python3 found; skipping"
   elif [ ! -f "$SCRIPT" ]; then
     echo "sync script not found at $SCRIPT; skipping"
   elif [ ! -f "$TOKEN_FILE" ]; then
     echo "no ABS token at $TOKEN_FILE; skipping"
   else
-    # HIBY_ABS_DRY_RUN=1 to exercise the whole hook without writing anything.
-    # Worth using the first time you wire this into ChronoSync.
     extra=""
     if [ "${HIBY_ABS_DRY_RUN:-0}" = "1" ]; then
       extra="--dry-run"

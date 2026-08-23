@@ -338,6 +338,71 @@ def build_updates(device: dict[str, dict], eps: dict[str, dict],
     return updates, unmatched, skipped
 
 
+def run_check(args) -> int:
+    """Validate everything the hook needs, changing nothing.
+
+    Exits non-zero on any failure regardless of --strict: this is an
+    interactive diagnostic, not the unattended sync path.
+    """
+    ok = True
+
+    def step(label: str, fn):
+        nonlocal ok
+        try:
+            log(f"  ok    {label}: {fn()}")
+        # SystemExit too: find_card and read_episode_paths bail that way, and
+        # SystemExit is not an Exception, so it would otherwise escape the
+        # check and be swallowed by the exit-0 guard in __main__.
+        except (Exception, SystemExit) as exc:
+            log(f"  FAIL  {label}: {exc}")
+            ok = False
+            return False
+        return True
+
+    log(f"host: {os.uname().nodename}")
+
+    tf = Path(os.path.expanduser(args.token_file))
+    token = ""
+    if step("token file", lambda: f"{tf} ({tf.stat().st_size} bytes, "
+                                 f"mode {oct(tf.stat().st_mode & 0o777)})"):
+        token = tf.read_text().strip()
+        if not token:
+            log("  FAIL  token file: empty")
+            ok = False
+
+    abs_ = Abs(args.abs_url, token)
+    if token:
+        step("ABS reachable + token valid",
+             lambda: f"{args.abs_url} as user "
+                     f"{abs_.get('/me').get('username')!r}")
+
+        def check_library():
+            d = abs_.get(f"/libraries/{args.library_id}")
+            lib = d.get("library") or d
+            if lib.get("mediaType") != "podcast":
+                raise RuntimeError(
+                    f"library is mediaType {lib.get('mediaType')!r}, "
+                    "expected 'podcast'")
+            secs, pct = abs_.finished_rule(args.library_id)
+            rule = (f"finished at <= {secs:g}s remaining" if secs
+                    else f"finished at >= {pct:g} complete" if pct
+                    else "no finished threshold set (requires true EOF)")
+            return f"{lib.get('name')!r}, {rule}"
+        step("podcast library", check_library)
+
+    def check_card():
+        card = find_card(args.card)
+        n = len(read_episode_paths(card))
+        state = collect_device_state(card, args.device_root)
+        played = sum(1 for s in state.values() if s["completed"])
+        return (f"{card}: {n} episodes indexed, {len(state)} with saved "
+                f"state, {played} played")
+    step("card", check_card)
+
+    log("check passed" if ok else "check FAILED")
+    return 0 if ok else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Push HiBy R1 podcast listening state into Audiobookshelf")
@@ -368,7 +433,14 @@ def main() -> int:
     ap.add_argument("--strict", action="store_true",
                     help="exit non-zero on error (default exits 0 so a "
                          "ChronoSync pre-sync failure cannot block the sync)")
+    ap.add_argument("--check", action="store_true",
+                    help="verify token, ABS reachability, the library and the "
+                         "card, then stop. Changes nothing. Use this when "
+                         "setting the hook up on a new machine.")
     args = ap.parse_args()
+
+    if args.check:
+        return run_check(args)
 
     token = Path(os.path.expanduser(args.token_file)).read_text().strip()
     if not token:
@@ -446,16 +518,19 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # The exit-0 guard exists so an unattended ChronoSync pre-sync failure
+    # cannot block a sync. It must NOT apply to --check, which is an
+    # interactive diagnostic whose whole job is to report failure.
+    _report = ("--strict" in sys.argv) or ("--check" in sys.argv)
     try:
         rc = main()
     except SystemExit as exc:
-        # argparse and our own bail-outs. Honour --strict only for real errors.
         code = exc.code if isinstance(exc.code, int) else 1
-        if code and "--strict" not in sys.argv:
+        if code and not _report:
             log(f"error (suppressed, no --strict): {exc}")
             code = 0
         rc = code
     except Exception as exc:  # never take a ChronoSync sync down with us
         log(f"unexpected error: {exc!r}")
-        rc = 1 if "--strict" in sys.argv else 0
+        rc = 1 if _report else 0
     sys.exit(rc)

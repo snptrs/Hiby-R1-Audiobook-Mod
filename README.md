@@ -145,6 +145,32 @@ Three behaviours worth knowing:
 
 Always try `--dry-run` first, or `HIBY_ABS_DRY_RUN=1` for the wrapper.
 
+**Setting it up on another Mac.** The sync script is standard library only, so
+system `python3` is enough: no Homebrew, no pip, and none of the firmware build
+toolchain. The wrapper locates the script relative to itself, so the repo can
+live anywhere and the file needs no editing. Clone the repo, write the ABS API
+token to `~/.config/abs/token` (`chmod 600`), then verify everything in one
+step with the card mounted:
+
+```bash
+python3 tools/abs_sync_listened.py \
+  --abs-url http://YOUR-ABS-HOST:13378 \
+  --library-id YOUR-PODCAST-LIBRARY-ID --check
+```
+
+`--check` validates the token, ABS reachability and auth, that the library is
+really a podcast library, and that the card is mounted with a `books.kind`
+column. It changes nothing and exits non-zero on failure. Then point ChronoSync
+at `tools/chronosync_presync_abs.sh`.
+
+If the ABS URL or library id differ from the defaults baked into the wrapper,
+override them in `~/.config/abs/config`:
+
+```
+HIBY_ABS_URL=http://other-host:13378/audiobookshelf
+HIBY_ABS_LIBRARY_ID=...
+```
+
 **Library**
 
 - Home menu: Continue, Titles, Authors, Podcasts, Folders, Finished, Refresh.
