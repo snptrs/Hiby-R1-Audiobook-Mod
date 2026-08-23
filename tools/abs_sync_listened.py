@@ -519,6 +519,34 @@ def reconcile(device: dict[str, dict], targets: dict[str, dict],
 # ----------------------------------------------------------------------- main
 
 
+def plan(args, device: dict[str, dict], targets: dict[str, dict],
+         progress: dict, can_pull: bool) -> tuple[list, list, list]:
+    """Translate parsed options into reconcile() arguments and apply
+    --only-finished.
+
+    Extracted from main so the option wiring is reachable from a test. It was
+    not, and a rename left a stale local referenced here: the run died with a
+    NameError, which the exit-0 guard then turned into a silent no-op.
+
+    finished_remaining_secs is passed straight through and may be None, which
+    reconcile reads as "use each target's own library setting".
+    """
+    actions, unmatched, skipped = reconcile(
+        device, targets, progress,
+        direction=args.direction,
+        finished_secs=args.finished_remaining_secs,
+        finished_frac=args.finished_remaining_frac,
+        finished_pct=None,
+        allow_rewind=args.allow_rewind,
+        can_pull=can_pull,
+        min_position_s=args.min_position_secs)
+    if args.only_finished:
+        actions = [a for a in actions
+                   if (a[0] == "push" and a[3]["finished"])
+                   or (a[0] == "pull" and a[3]["completed"])]
+    return actions, unmatched, skipped
+
+
 def device_clock_ok(device: dict[str, dict]) -> tuple[bool, str]:
     """Are the device's .pos timestamps usable for ordering against ABS?
 
@@ -721,16 +749,7 @@ def main() -> int:
     log(f"items known to ABS: {len(targets)}")
     prog = abs_.progress()
 
-    actions, unmatched, skipped = reconcile(
-        device, targets, prog, direction=args.direction,
-        finished_secs=finished_secs, finished_frac=args.finished_remaining_frac,
-        finished_pct=None, allow_rewind=args.allow_rewind,
-        can_pull=can_pull, min_position_s=args.min_position_secs)
-
-    if args.only_finished:
-        actions = [a for a in actions
-                   if (a[0] == "push" and a[3]["finished"])
-                   or (a[0] == "pull" and a[3]["completed"])]
+    actions, unmatched, skipped = plan(args, device, targets, prog, can_pull)
 
     for rel in unmatched:
         log(f"  no ABS match: {rel}")
