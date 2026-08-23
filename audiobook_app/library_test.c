@@ -40,6 +40,19 @@ static int print_book_cb(const audiobook_book_t *b, void *ctx) {
     return 0;
 }
 
+static int episode_count = 0;
+
+static int print_episode_cb(const audiobook_book_t *b, void *ctx) {
+    (void)ctx;
+    printf("    %5.1f  %-40s  %7lld ms  key=%s\n",
+           b->series_number, b->title, (long long)b->total_duration_ms,
+           b->book_key);
+    printf("           path=%s cover=%s\n", b->root_path,
+           b->cover_path[0] ? b->cover_path : "(none)");
+    episode_count++;
+    return 0;
+}
+
 static int print_track_cb(const audiobook_track_t *t, void *ctx) {
     (void)ctx;
     printf("    %3d. %s (%lld ms, %lld bytes, ch=%d)\n",
@@ -84,16 +97,41 @@ static void scan_progress(int stage, int current, int total,
     }
 }
 
+static int show_count;
+
+static int count_name_cb(const char *name, void *ctx) {
+    (void)ctx; (void)name; show_count++; return 0;
+}
+
+static int show_cb(const char *show, void *ctx) {
+    sqlite3 *db = (sqlite3 *)ctx;
+    printf("  Show: %s\n", show);
+    show_count++;
+    episode_count = 0;
+    audiobook_list_episodes_by_show(db, show, print_episode_cb, NULL);
+    printf("    (%d episodes)\n", episode_count);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *root = AUDIOBOOK_LIBRARY_ROOT;
     const char *db_path = "library_test.db";
+    int podcast_mode = 0;
 
-    if (argc >= 2) root = argv[1];
-    if (argc >= 3) db_path = argv[2];
+    /* --podcast scans `root` as a podcast root (one book row per FILE) instead
+     * of as audiobooks (one book per folder). */
+    int argi = 1;
+    if (argc > argi && strcmp(argv[argi], "--podcast") == 0) {
+        podcast_mode = 1;
+        argi++;
+    }
+    if (argc > argi) root = argv[argi++];
+    if (argc > argi) db_path = argv[argi++];
 
     printf("Audiobook Library Test\n");
     printf("  root: %s\n", root);
     printf("  db:   %s\n", db_path);
+    printf("  mode: %s\n", podcast_mode ? "podcast" : "audiobook");
     printf("\n");
 
     sqlite3 *db = NULL;
@@ -106,7 +144,9 @@ int main(int argc, char **argv) {
     /* Scan */
     printf("Scanning library...\n");
     time_t start = time(NULL);
-    if (audiobook_scan_library(db, root, scan_progress, NULL) < 0) {
+    if (audiobook_scan_root(db, root,
+                            podcast_mode ? LIB_KIND_PODCAST : LIB_KIND_BOOK,
+                            NULL, scan_progress, NULL) < 0) {
         fprintf(stderr, "Scan failed.\n");
         audiobook_db_close(db);
         return 1;
@@ -114,6 +154,32 @@ int main(int argc, char **argv) {
     time_t elapsed = time(NULL) - start;
     printf("\r  Scan complete in %lld s.                \n\n",
            (long long)elapsed);
+
+    if (podcast_mode) {
+        /* Episodes are kind=1, so they never appear in audiobook_list_books.
+         * Report them the way the UI will: shows, then their episodes. */
+        printf("=== Shows ===\n");
+        show_count = 0;
+        audiobook_list_shows(db, show_cb, db);
+        printf("\nTotal shows: %d\n\n", show_count);
+
+        printf("=== Leakage check (should all be empty) ===\n");
+        book_count = 0;
+        audiobook_list_books(db, print_book_cb, NULL);
+        printf("  Titles:  %d\n", book_count);
+        show_count = 0;
+        audiobook_list_series(db, count_name_cb, NULL);
+        printf("  Series:  %d\n", show_count);
+        show_count = 0;
+        audiobook_list_authors(db, count_name_cb, NULL);
+        printf("  Authors: %d\n", show_count);
+        show_count = 0;
+        audiobook_list_folders(db, count_name_cb, NULL);
+        printf("  Folders: %d\n\n", show_count);
+
+        audiobook_db_close(db);
+        return 0;
+    }
 
     /* Report all books */
     printf("=== All Books ===\n");

@@ -38,6 +38,8 @@ $sources = @(
     "audiobook_app\library.c",
     "audiobook_app\scan.c",
     "audiobook_app\tags.c",
+    "audiobook_app\bookmark_sd.c",
+    "audiobook_app\library_test_stubs.c",
     "audiobook_app\sqlite3.c"
 )
 
