@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
-"""Push podcast listening state from a HiBy R1 SD card into Audiobookshelf.
+"""Sync listening state between a HiBy R1 SD card and Audiobookshelf.
 
-Read-only with respect to the card and the device. The R1 already writes
-everything needed onto the SD card itself, so no firmware involvement:
+The R1 writes everything needed onto the SD card itself, so no firmware
+involvement:
 
   <card>/.audiobook_pos/<book_id>.pos          authoritative position/played
-  <card>/Audiobooks/.audiobook_library/library.db   book_id -> file path
+  <card>/Audiobooks/.audiobook_library/library.db   book_id -> paths, kind
 
 A .pos file is five lines: track_ordinal, track_pos_ms, book_elapsed_ms,
 completed (0/1), unix timestamp. See audiobook_app/posstore.h.
 
+Directions (--direction):
+  push   device -> ABS. Read-only with respect to the card.
+  pull   ABS -> device. WRITES .pos files on the card.
+  both
+
 Intended as a ChronoSync PRE-sync script, so that:
-  1. this runs and marks played episodes finished in ABS,
+  1. this reconciles state in both directions,
   2. ABS drops played episodes from disk per its retention settings,
   3. the sync then propagates those deletions to the card.
-Deletions therefore flow Mac -> card through the normal sync, and the device
-never deletes anything.
+Media deletions therefore flow Mac -> card through the normal sync; this script
+only ever writes .pos files, never media.
 
-Exits 0 even on failure unless --strict, because ChronoSync can be set to abort
-a sync when a pre-sync script fails and a transient ABS outage should not stop
-new episodes reaching the card.
+Exits 0 even on failure unless --strict or --check, because ChronoSync can be
+set to abort a sync when a pre-sync script fails and a transient ABS outage
+should not stop new episodes reaching the card.
 """
 
 from __future__ import annotations
@@ -31,18 +36,31 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-# Where the app mounts the card on the device. Track paths in library.db are
-# absolute device paths, so this prefix is stripped to get a card-relative key.
-DEVICE_PODCAST_ROOT = "/usr/data/mnt/sd_0/Podcasts"
+# Track paths in library.db are absolute device paths; these prefixes are
+# stripped to get the card-relative key that also matches an ABS relPath.
+DEVICE_ROOTS = {
+    "podcast": "/usr/data/mnt/sd_0/Podcasts",
+    "book": "/usr/data/mnt/sd_0/Audiobooks",
+}
 POS_DIRNAME = ".audiobook_pos"
 DB_RELPATH = "Audiobooks/.audiobook_library/library.db"
 
-LIB_KIND_PODCAST = 1
+KIND_BOOK, KIND_PODCAST = 0, 1
+
+# A device clock this far ahead of ours means .pos timestamps cannot be trusted
+# to order against ABS lastUpdate, so pulling is unsafe.
+CLOCK_SKEW_TOLERANCE_S = 3600
+# For a multi-file book, both directions assume the device's track order and
+# ABS's concatenation produce the same timeline. Agreeing totals is the
+# available proxy for that.
+BOOK_DURATION_TOLERANCE_S = 30.0
+BOOK_DURATION_TOLERANCE_FRAC = 0.02
 
 
 def log(msg: str) -> None:
@@ -53,9 +71,9 @@ def norm(s: str) -> str:
     """Key for comparing paths across filesystems.
 
     macOS stores filenames decomposed (NFD) while exFAT keeps whatever it was
-    given, so the same episode can differ byte-for-byte between the card and
-    what ABS reports. Several of these shows have accented titles, so without
-    NFC normalisation the match silently fails. Case is folded too: exFAT is
+    given, so the same item can differ byte-for-byte between the card and what
+    ABS reports. Several shows have accented titles, so without NFC
+    normalisation the match silently fails. Case is folded too: exFAT is
     case-insensitive and so is a default APFS volume.
     """
     return unicodedata.normalize("NFC", s).casefold()
@@ -71,28 +89,26 @@ def find_card(explicit: str | None) -> Path:
             raise SystemExit(f"no {POS_DIRNAME}/ under {p}")
         return p
     candidates = [
-        v for v in Path("/Volumes").iterdir()
-        if (v / POS_DIRNAME).is_dir()
+        v for v in Path("/Volumes").iterdir() if (v / POS_DIRNAME).is_dir()
     ] if Path("/Volumes").is_dir() else []
     if not candidates:
         raise SystemExit(
             f"no mounted volume contains {POS_DIRNAME}/ (card not mounted?)")
     if len(candidates) > 1:
-        raise SystemExit(
-            "multiple candidate cards: "
-            + ", ".join(str(c) for c in candidates)
-            + " (pass --card)")
+        raise SystemExit("multiple candidate cards: "
+                         + ", ".join(str(c) for c in candidates)
+                         + " (pass --card)")
     return candidates[0]
 
 
-def read_episode_paths(card: Path) -> dict[int, str]:
-    """book_id -> device track path, for podcast episodes only."""
+def read_library(card: Path) -> list[dict]:
+    """One row per book/episode, with its tracks in the device's own order."""
     db = card / DB_RELPATH
     if not db.is_file():
         raise SystemExit(f"library.db not found at {db}")
     # Copied before opening: the card is removable and may carry a hot rollback
-    # journal, which would make a direct read-only open fail. The DB is under
-    # 1 MB so this is cheap, and it guarantees we never write to the card.
+    # journal, which would make a direct read-only open fail. Under 1 MB, and it
+    # guarantees we never write to the DB.
     with tempfile.TemporaryDirectory() as td:
         local = Path(td) / "library.db"
         shutil.copy2(db, local)
@@ -103,13 +119,24 @@ def read_episode_paths(card: Path) -> dict[int, str]:
                 raise SystemExit(
                     "library.db has no books.kind column: the card was written "
                     "by a firmware build without podcast support")
-            rows = con.execute(
-                "SELECT b.book_id, t.path "
-                "FROM books b JOIN tracks t ON t.book_id = b.book_id "
-                "WHERE b.kind = ?", (LIB_KIND_PODCAST,)).fetchall()
+            books = con.execute(
+                "SELECT book_id, kind, root_path, track_count FROM books"
+            ).fetchall()
+            tracks: dict[int, list[tuple[int, str, int]]] = {}
+            for bid, ordinal, path, dur in con.execute(
+                    "SELECT book_id, ordinal, path, duration_ms FROM tracks "
+                    "ORDER BY book_id, disc_number, track_number, ordinal"):
+                tracks.setdefault(bid, []).append((ordinal, path, dur or 0))
         finally:
             con.close()
-    return {int(bid): path for bid, path in rows if path}
+    out = []
+    for bid, kind, root, tc in books:
+        tl = tracks.get(bid, [])
+        if not tl:
+            continue
+        out.append({"book_id": bid, "kind": kind, "root_path": root,
+                    "track_count": tc, "tracks": tl})
+    return out
 
 
 def read_pos(card: Path, book_id: int) -> dict | None:
@@ -127,7 +154,7 @@ def read_pos(card: Path, book_id: int) -> dict | None:
             "book_elapsed_ms": int(parts[2]),
             "completed": int(parts[3]) == 1,
             # 5th field is the device's save time. Older builds may omit it;
-            # fall back to the file mtime so the conflict rule still works.
+            # fall back to the file mtime so ordering still works.
             "saved_at": int(parts[4]) if len(parts) > 4
             else int(p.stat().st_mtime),
         }
@@ -135,18 +162,59 @@ def read_pos(card: Path, book_id: int) -> dict | None:
         return None
 
 
-def collect_device_state(card: Path, device_root: str) -> dict[str, dict]:
-    """relative key -> device listening state."""
+def write_pos(card: Path, book_id: int, ordinal: int, track_pos_ms: int,
+              book_elapsed_ms: int, completed: bool, saved_at: int) -> None:
+    """Write a .pos the way the device does: temp file then rename.
+
+    saved_at is deliberately the source's timestamp (ABS lastUpdate), not now.
+    Stamping it with the current time would make the file look newer than the
+    ABS state it came from, so the next run would push it straight back and the
+    two would ping-pong.
+    """
+    d = card / POS_DIRNAME
+    d.mkdir(exist_ok=True)
+    tmp = d / f"{book_id}.pos.tmp"
+    tmp.write_text(f"{ordinal}\n{track_pos_ms}\n{book_elapsed_ms}\n"
+                   f"{1 if completed else 0}\n{saved_at}\n")
+    os.replace(tmp, d / f"{book_id}.pos")
+
+
+def split_position(tracks: list[tuple[int, str, int]],
+                   book_elapsed_ms: int) -> tuple[int, int]:
+    """Book-relative ms -> (track_ordinal, ms within that track).
+
+    Mirrors the accumulate-durations walk the player itself does in cmd_seek.
+    """
+    acc = 0
+    for ordinal, _path, dur in tracks:
+        if book_elapsed_ms < acc + dur or (ordinal, _path, dur) == tracks[-1]:
+            return ordinal, max(0, book_elapsed_ms - acc)
+        acc += dur
+    return (tracks[0][0] if tracks else 1), max(0, book_elapsed_ms)
+
+
+def collect_device_state(card: Path, kinds: set[int]) -> dict[str, dict]:
+    """relative key -> device state, for the requested kinds."""
     out: dict[str, dict] = {}
-    prefix = device_root.rstrip("/") + "/"
-    for book_id, path in read_episode_paths(card).items():
-        if not path.startswith(prefix):
+    for row in read_library(card):
+        if row["kind"] not in kinds:
             continue
-        pos = read_pos(card, book_id)
-        if pos is None:
-            continue  # never played
-        pos["rel"] = path[len(prefix):]
-        out[norm(pos["rel"])] = pos
+        root = DEVICE_ROOTS["podcast" if row["kind"] == KIND_PODCAST else "book"]
+        prefix = root.rstrip("/") + "/"
+        # A podcast episode is keyed on its FILE, a book on its FOLDER, which is
+        # what makes each match the corresponding ABS relPath.
+        raw = (row["tracks"][0][1] if row["kind"] == KIND_PODCAST
+               else row["root_path"])
+        if not raw.startswith(prefix):
+            continue
+        rel = raw[len(prefix):]
+        pos = read_pos(card, row["book_id"])
+        out[norm(rel)] = {
+            "rel": rel, "book_id": row["book_id"], "kind": row["kind"],
+            "tracks": row["tracks"],
+            "device_total_ms": sum(t[2] for t in row["tracks"]),
+            "pos": pos,
+        }
     return out
 
 
@@ -172,9 +240,8 @@ class Abs:
         if not raw:
             return None
         # Progress updates answer 200 with a plain-text "OK" body, not JSON.
-        # Parsing unconditionally raised, and because the exception happened
-        # after the server had already applied the change, every successful
-        # update was reported as a failure.
+        # Parsing unconditionally raised AFTER the server had applied the
+        # change, so every successful update was reported as a failure.
         if "json" not in ctype:
             return raw.decode("utf-8", "replace").strip()
         return json.loads(raw)
@@ -185,22 +252,22 @@ class Abs:
     def patch(self, path: str, body: dict):
         """Media progress is PATCH, verified against a live server.
 
-        The published API reference says POST for this endpoint; POST actually
-        returns 404 and PATCH returns 200. The episode id is required for
-        podcasts: PATCH on the library-item id alone returns 400.
+        The published API reference says POST; POST returns 404 and PATCH
+        returns 200. The episode id is required for podcasts: PATCH on the
+        library-item id alone returns 400.
         """
         return self._req("PATCH", path, body)
 
     def episodes(self, library_id: str) -> dict[str, dict]:
-        """relative key -> episode identity, matching the card's layout.
+        """Podcast episodes, keyed to match the card's layout.
 
         item.relPath is the show folder relative to the ABS library root and
         audioFile.metadata.relPath is the file within it, which together form
         the same relative path the card uses.
         """
-        items = self.get(f"/libraries/{library_id}/items?limit=1000")
         out: dict[str, dict] = {}
-        for stub in items.get("results", []):
+        for stub in self.get(f"/libraries/{library_id}/items?limit=1000"
+                             ).get("results", []):
             item = self.get(f"/items/{stub['id']}")
             show = (item.get("relPath") or "").strip("/")
             for ep in (item.get("media") or {}).get("episodes") or []:
@@ -211,12 +278,29 @@ class Abs:
                     continue
                 key = f"{show}/{rel}" if show else rel
                 out[norm(key)] = {
-                    "rel": key,
+                    "rel": key, "kind": KIND_PODCAST,
                     "library_item_id": ep.get("libraryItemId") or stub["id"],
-                    "episode_id": ep["id"],
-                    "duration": af.get("duration"),
-                    "title": ep.get("title"),
+                    "episode_id": ep["id"], "duration": af.get("duration"),
                 }
+        return out
+
+    def books(self, library_id: str) -> dict[str, dict]:
+        """Audiobooks, keyed on the item folder (its relPath)."""
+        out: dict[str, dict] = {}
+        for stub in self.get(f"/libraries/{library_id}/items?limit=2000"
+                             ).get("results", []):
+            rel = (stub.get("relPath") or "").strip("/")
+            if not rel:
+                continue
+            media = stub.get("media") or {}
+            dur = media.get("duration")
+            if dur is None:
+                dur = (media.get("metadata") or {}).get("duration")
+            out[norm(rel)] = {
+                "rel": rel, "kind": KIND_BOOK,
+                "library_item_id": stub["id"], "episode_id": None,
+                "duration": dur,
+            }
         return out
 
     def finished_rule(self, library_id: str) -> tuple[float | None, float | None]:
@@ -225,11 +309,7 @@ class Abs:
         Used as the default so ABS stays the single place this is configured.
         The server does NOT apply these to progress pushed over the API: at 30s
         remaining a PATCH leaves isFinished false even with the setting at 10s,
-        because the rule runs on ABS's own playback sessions. So we read the
-        number from ABS and do the applying ourselves.
-
-        markAsFinishedTimeRemaining is in seconds; markAsFinishedPercentComplete
-        is a 0-1 fraction. Either may be null.
+        because the rule runs on ABS's own playback sessions.
         """
         try:
             d = self.get(f"/libraries/{library_id}")
@@ -240,16 +320,14 @@ class Abs:
         pct = s.get("markAsFinishedPercentComplete")
         return (float(secs) if secs else None), (float(pct) if pct else None)
 
-    def progress(self) -> dict[tuple[str, str], dict]:
-        me = self.get("/me")
+    def progress(self) -> dict[tuple[str, str | None], dict]:
         out = {}
-        for p in me.get("mediaProgress") or []:
-            if p.get("episodeId"):
-                out[(p["libraryItemId"], p["episodeId"])] = p
+        for p in self.get("/me").get("mediaProgress") or []:
+            out[(p["libraryItemId"], p.get("episodeId"))] = p
         return out
 
 
-# ----------------------------------------------------------------------- main
+# --------------------------------------------------------------- reconcile
 
 
 def near_end(elapsed_s: float, duration: float | None,
@@ -258,15 +336,10 @@ def near_end(elapsed_s: float, duration: float | None,
     """Treat 'almost at the end' as finished.
 
     The device only sets completed=1 when the decoder runs off the true end of
-    the file: there is no percentage threshold in the firmware (see the three
-    EOF sites in player.c). Audiobooks are usually played out, but podcasts
-    routinely end with 30-90s of outro or trailing ads, so stopping when the
-    content ends leaves the episode permanently unfinished, never synced, and
-    never cleaned up.
-
-    The allowance scales with length, min(flat, duration*frac), so a two-minute
-    news bulletin is not declared finished a third of the way in while a
-    three-hour episode still gets the full flat allowance.
+    the file: there is no percentage threshold in the firmware. Audiobooks are
+    usually played out, but podcasts routinely end with 30-90s of outro, so
+    stopping when the content ends would leave an episode permanently
+    unfinished, never synced and never cleaned up.
     """
     if not duration or duration <= 0:
         return False
@@ -274,85 +347,184 @@ def near_end(elapsed_s: float, duration: float | None,
         return True
     if not flat_secs:
         return False
-    # Scale the allowance down for short episodes so a ten-minute news bulletin
-    # is not called finished a third of the way in.
     allowance = min(flat_secs, duration * frac) if frac else flat_secs
     return (duration - elapsed_s) <= allowance
 
 
-def build_updates(device: dict[str, dict], eps: dict[str, dict],
-                  prog: dict[tuple[str, str], dict],
-                  only_finished: bool,
-                  finished_secs: float | None, finished_frac: float | None,
-                  finished_pct: float | None, allow_rewind: bool,
-                  rewind_grace_s: float = 60.0) -> tuple[list, list, list]:
-    updates, unmatched, skipped = [], [], []
-    for key, st in sorted(device.items(), key=lambda kv: kv[1]["rel"]):
-        ep = eps.get(key)
-        if ep is None:
-            unmatched.append(st["rel"])
+# Positions within this much of each other are the same place. The device
+# stores integer ms and ABS a float of seconds, so exact equality never holds.
+SAME_POSITION_S = 1.0
+
+
+def materially_same(dev_secs: float | None, dev_fin: bool,
+                    abs_secs: float | None, abs_fin: bool) -> bool:
+    """Would syncing either way be a no-op?
+
+    Without this, an item whose two sides already agree still gets rewritten
+    whenever one timestamp happens to be newer, so every run would rewrite .pos
+    files on the card and fill the log with churn.
+    """
+    if dev_secs is None or abs_secs is None:
+        return False
+    if dev_fin != abs_fin:
+        return False
+    return abs(dev_secs - abs_secs) <= SAME_POSITION_S
+
+
+def timeline_trustworthy(dev: dict, tgt: dict) -> bool:
+    """Do the device and ABS agree on this item's timeline?
+
+    Only in question for a multi-file book, where the device sums its own track
+    durations in its own order and ABS concatenates in its. A single-file item
+    has nothing to disagree about. Agreeing totals is the available proxy; if
+    they differ, positions would land somewhere else entirely, so skip.
+    """
+    if dev["kind"] == KIND_PODCAST or len(dev["tracks"]) <= 1:
+        return True
+    abs_total = tgt.get("duration")
+    if not abs_total:
+        return False
+    dev_total = dev["device_total_ms"] / 1000.0
+    tol = max(BOOK_DURATION_TOLERANCE_S,
+              abs_total * BOOK_DURATION_TOLERANCE_FRAC)
+    return abs(dev_total - abs_total) <= tol
+
+
+def reconcile(device: dict[str, dict], targets: dict[str, dict],
+              progress: dict[tuple[str, str | None], dict], *,
+              direction: str, finished_secs: float | None,
+              finished_frac: float | None, finished_pct: float | None,
+              allow_rewind: bool, can_pull: bool,
+              rewind_grace_s: float = 60.0) -> tuple[list, list, list]:
+    """Pure decision step. Returns (actions, unmatched, skipped).
+
+    An action is (kind_of_action, dev, tgt, payload) where kind_of_action is
+    "push" or "pull".
+    """
+    actions, unmatched, skipped = [], [], []
+
+    for key in sorted(device, key=lambda k: device[k]["rel"]):
+        dev = device[key]
+        tgt = targets.get(key)
+        if tgt is None:
+            unmatched.append(dev["rel"])
+            continue
+        if not timeline_trustworthy(dev, tgt):
+            skipped.append(f"{dev['rel']}: device and ABS disagree on total "
+                           f"duration, refusing to map positions")
             continue
 
-        secs = st["book_elapsed_ms"] / 1000.0
-        dur = ep.get("duration")
-        finished = st["completed"] or near_end(
-            secs, dur, finished_secs, finished_frac, finished_pct)
+        cur = progress.get((tgt["library_item_id"], tgt["episode_id"]))
+        pos = dev["pos"]
+        dev_secs = (pos["book_elapsed_ms"] / 1000.0) if pos else None
+        dev_when = pos["saved_at"] if pos else None
+        abs_secs = (cur.get("currentTime") or 0.0) if cur else None
+        abs_when = ((cur.get("lastUpdate") or 0) / 1000.0) if cur else None
+        dur = tgt.get("duration")
 
-        if only_finished and not finished:
+        dev_fin = bool(pos and (pos["completed"] or near_end(
+            dev_secs, dur, finished_secs, finished_frac, finished_pct)))
+        abs_fin = bool(cur and cur.get("isFinished"))
+
+        # Decide which side is authoritative: the more recent save wins.
+        if pos is None and cur is None:
             continue
-
-        cur = prog.get((ep["library_item_id"], ep["episode_id"]))
-
-        # Never move a position backwards. The device's timestamp being newer
-        # is not enough on its own: a brief tap on the device (or a stray
-        # position from a playback bug) is "newer" than a genuine 18-minute
-        # position set in the web player, and pushing it would silently destroy
-        # real listening state. Verified the hard way. Finishing is always
-        # allowed through, since that is not a regression.
-        if cur and not finished and not allow_rewind:
-            prev = cur.get("currentTime") or 0
-            if secs + rewind_grace_s < prev:
-                skipped.append(
-                    f"{st['rel']}: device {secs:.0f}s is behind ABS "
-                    f"{prev:.0f}s, not rewinding")
-                continue
-
-        # Among non-regressive updates, the newer save wins, so repeated syncs
-        # do not fight the server.
-        if cur and (cur.get("lastUpdate") or 0) / 1000.0 >= st["saved_at"]:
+        if materially_same(dev_secs, dev_fin, abs_secs, abs_fin):
             continue
-
-        body: dict[str, object] = {}
-        if finished:
-            if cur and cur.get("isFinished"):
-                continue
-            body["isFinished"] = True
+        if pos is None:
+            newer = "abs"
+        elif cur is None:
+            newer = "device"
         else:
-            body["currentTime"] = round(secs, 3)
-            if dur:
-                body["duration"] = dur
-                body["progress"] = round(min(secs / dur, 1.0), 6)
-        st = dict(st, finished=finished,
-                  by_threshold=finished and not st["completed"])
-        updates.append((ep, st, body))
-    return updates, unmatched, skipped
+            newer = "device" if dev_when > abs_when else "abs"
+
+        if newer == "device" and direction in ("push", "both"):
+            if abs_fin and dev_fin:
+                continue
+            # Never move a position backwards. A brief tap on the device is
+            # "newer" than a genuine position set in the web player, and
+            # pushing it would silently destroy real listening state. Finishing
+            # is exempt: it is not a regression.
+            if cur and not dev_fin and not allow_rewind \
+                    and dev_secs + rewind_grace_s < abs_secs:
+                skipped.append(
+                    f"{dev['rel']}: device {dev_secs:.0f}s is behind ABS "
+                    f"{abs_secs:.0f}s, not rewinding ABS")
+                continue
+            body: dict[str, object] = {}
+            if dev_fin:
+                if abs_fin:
+                    continue
+                body["isFinished"] = True
+            else:
+                body["currentTime"] = round(dev_secs, 3)
+                if dur:
+                    body["duration"] = dur
+                    body["progress"] = round(min(dev_secs / dur, 1.0), 6)
+            actions.append(("push", dev, tgt,
+                            {"body": body, "finished": dev_fin,
+                             "by_threshold": dev_fin and not pos["completed"]}))
+
+        elif newer == "abs" and direction in ("pull", "both"):
+            if not can_pull:
+                continue
+            if dev_fin and abs_fin:
+                continue
+            # Symmetric guard: do not rewind the device either.
+            if pos and not abs_fin and not allow_rewind \
+                    and abs_secs + rewind_grace_s < dev_secs:
+                skipped.append(
+                    f"{dev['rel']}: ABS {abs_secs:.0f}s is behind device "
+                    f"{dev_secs:.0f}s, not rewinding the device")
+                continue
+            # A finished ABS item reports currentTime 0, so write elapsed 0 and
+            # let the completed flag stand: the player restarts a finished item
+            # from the beginning anyway.
+            elapsed_ms = 0 if abs_fin else int(round(abs_secs * 1000))
+            ordinal, within = split_position(dev["tracks"], elapsed_ms)
+            actions.append(("pull", dev, tgt, {
+                "ordinal": ordinal, "track_pos_ms": within,
+                "book_elapsed_ms": elapsed_ms, "completed": abs_fin,
+                # Carry ABS's own timestamp so the file does not look newer
+                # than the state it came from.
+                "saved_at": int(abs_when or time.time()),
+                "abs_secs": abs_secs,
+            }))
+
+    return actions, unmatched, skipped
+
+
+# ----------------------------------------------------------------------- main
+
+
+def device_clock_ok(device: dict[str, dict]) -> tuple[bool, str]:
+    """Are the device's .pos timestamps usable for ordering against ABS?
+
+    Pull direction depends on comparing them, so a badly wrong device clock
+    would let the wrong side win. A clock in the future is the detectable case;
+    the Mac's own clock is assumed sane (it is NTP-synced).
+    """
+    stamps = [d["pos"]["saved_at"] for d in device.values() if d["pos"]]
+    if not stamps:
+        return True, "no saved positions to check"
+    newest = max(stamps)
+    skew = newest - int(time.time())
+    if skew > CLOCK_SKEW_TOLERANCE_S:
+        return False, (f"device clock looks {skew / 3600:.1f}h ahead "
+                       f"(newest .pos is in the future)")
+    return True, f"newest .pos {abs(skew) / 3600:.1f}h from now"
 
 
 def run_check(args) -> int:
-    """Validate everything the hook needs, changing nothing.
-
-    Exits non-zero on any failure regardless of --strict: this is an
-    interactive diagnostic, not the unattended sync path.
-    """
     ok = True
 
-    def step(label: str, fn):
+    def step(label, fn):
         nonlocal ok
         try:
             log(f"  ok    {label}: {fn()}")
-        # SystemExit too: find_card and read_episode_paths bail that way, and
-        # SystemExit is not an Exception, so it would otherwise escape the
-        # check and be swallowed by the exit-0 guard in __main__.
+        # SystemExit too: find_card and read_library bail that way, and
+        # SystemExit is not an Exception, so it would otherwise escape and be
+        # swallowed by the exit-0 guard in __main__.
         except (Exception, SystemExit) as exc:
             log(f"  FAIL  {label}: {exc}")
             ok = False
@@ -360,11 +532,12 @@ def run_check(args) -> int:
         return True
 
     log(f"host: {os.uname().nodename}")
+    log(f"direction: {args.direction}")
 
     tf = Path(os.path.expanduser(args.token_file))
     token = ""
-    if step("token file", lambda: f"{tf} ({tf.stat().st_size} bytes, "
-                                 f"mode {oct(tf.stat().st_mode & 0o777)})"):
+    if step("token file", lambda: f"{tf} ({tf.stat().st_size} bytes, mode "
+                                 f"{oct(tf.stat().st_mode & 0o777)})"):
         token = tf.read_text().strip()
         if not token:
             log("  FAIL  token file: empty")
@@ -376,27 +549,36 @@ def run_check(args) -> int:
              lambda: f"{args.abs_url} as user "
                      f"{abs_.get('/me').get('username')!r}")
 
-        def check_library():
-            d = abs_.get(f"/libraries/{args.library_id}")
+        def check_lib(lib_id, want):
+            d = abs_.get(f"/libraries/{lib_id}")
             lib = d.get("library") or d
-            if lib.get("mediaType") != "podcast":
-                raise RuntimeError(
-                    f"library is mediaType {lib.get('mediaType')!r}, "
-                    "expected 'podcast'")
-            secs, pct = abs_.finished_rule(args.library_id)
+            if lib.get("mediaType") != want:
+                raise RuntimeError(f"mediaType {lib.get('mediaType')!r}, "
+                                   f"expected {want!r}")
+            secs, pct = abs_.finished_rule(lib_id)
             rule = (f"finished at <= {secs:g}s remaining" if secs
                     else f"finished at >= {pct:g} complete" if pct
                     else "no finished threshold set (requires true EOF)")
             return f"{lib.get('name')!r}, {rule}"
-        step("podcast library", check_library)
+        step("podcast library", lambda: check_lib(args.library_id, "podcast"))
+        if args.book_library_id:
+            step("audiobook library",
+                 lambda: check_lib(args.book_library_id, "book"))
+        else:
+            log("  --    audiobook library: not configured "
+                "(pass --book-library-id to include audiobooks)")
 
     def check_card():
         card = find_card(args.card)
-        n = len(read_episode_paths(card))
-        state = collect_device_state(card, args.device_root)
-        played = sum(1 for s in state.values() if s["completed"])
-        return (f"{card}: {n} episodes indexed, {len(state)} with saved "
-                f"state, {played} played")
+        kinds = {KIND_PODCAST} | ({KIND_BOOK} if args.book_library_id else set())
+        state = collect_device_state(card, kinds)
+        with_pos = [d for d in state.values() if d["pos"]]
+        played = sum(1 for d in with_pos if d["pos"]["completed"])
+        clock_ok, why = device_clock_ok(state)
+        if not clock_ok:
+            raise RuntimeError(f"{why}; pulling would be unsafe")
+        return (f"{card}: {len(state)} items, {len(with_pos)} with saved "
+                f"state, {played} played; clock {why}")
     step("card", check_card)
 
     log("check passed" if ok else "check FAILED")
@@ -405,38 +587,42 @@ def run_check(args) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Push HiBy R1 podcast listening state into Audiobookshelf")
+        description="Sync listening state between a HiBy R1 card and "
+                    "Audiobookshelf")
     ap.add_argument("--abs-url", required=True,
                     help="ABS base URL, including any reverse-proxy subpath "
                          "(e.g. http://host:13378 or http://host/audiobookshelf)")
     ap.add_argument("--library-id", required=True, help="ABS podcast library id")
+    ap.add_argument("--book-library-id",
+                    help="ABS audiobook library id. Omit to sync podcasts only.")
     ap.add_argument("--token-file", default="~/.config/abs/token")
     ap.add_argument("--card", help="card mount point (default: auto-detect)")
-    ap.add_argument("--device-root", default=DEVICE_PODCAST_ROOT)
+    ap.add_argument("--direction", choices=("push", "pull", "both"),
+                    default="push",
+                    help="push: device -> ABS (read-only on the card). "
+                         "pull: ABS -> device (WRITES .pos files). "
+                         "Default push.")
     ap.add_argument("--dry-run", action="store_true",
-                    help="report what would change, send nothing")
+                    help="report what would change, change nothing")
     ap.add_argument("--only-finished", action="store_true",
-                    help="skip partial positions, push played episodes only")
+                    help="skip partial positions, sync played state only")
     ap.add_argument("--finished-remaining-secs", type=float, default=None,
-                    help="treat an episode as finished when this many seconds "
+                    help="treat an item as finished when this many seconds "
                          "remain. Default: the library's own "
                          "markAsFinishedTimeRemaining, so ABS stays the one "
                          "place this is configured. 0 requires true EOF.")
     ap.add_argument("--finished-remaining-frac", type=float, default=0.10,
                     # Not an ABS concept; ours, to protect short episodes.
-                    help="cap the above at this fraction of the episode, so "
-                         "short episodes need a tighter margin (default 0.10)")
+                    help="cap the above at this fraction of the item, so short "
+                         "episodes need a tighter margin (default 0.10)")
     ap.add_argument("--allow-rewind", action="store_true",
-                    help="permit pushing a position EARLIER than the one ABS "
-                         "already has (off by default: it destroys real "
-                         "listening state)")
+                    help="permit moving a position EARLIER on either side "
+                         "(off by default: it destroys real listening state)")
     ap.add_argument("--strict", action="store_true",
                     help="exit non-zero on error (default exits 0 so a "
                          "ChronoSync pre-sync failure cannot block the sync)")
     ap.add_argument("--check", action="store_true",
-                    help="verify token, ABS reachability, the library and the "
-                         "card, then stop. Changes nothing. Use this when "
-                         "setting the hook up on a new machine.")
+                    help="verify token, ABS, libraries and card, then stop")
     args = ap.parse_args()
 
     if args.check:
@@ -447,71 +633,92 @@ def main() -> int:
         raise SystemExit(f"empty token file: {args.token_file}")
 
     card = find_card(args.card)
-    log(f"card: {card}")
-    device = collect_device_state(card, args.device_root)
-    log(f"episodes with saved state on card: {len(device)}"
-        f" ({sum(1 for s in device.values() if s['completed'])} played)")
+    kinds = {KIND_PODCAST} | ({KIND_BOOK} if args.book_library_id else set())
+    device = collect_device_state(card, kinds)
+    log(f"card: {card} ({len(device)} items, "
+        f"{sum(1 for d in device.values() if d['pos'])} with saved state)")
+
+    # Pulling orders the device's .pos timestamps against ABS lastUpdate, so a
+    # device clock in the future would let stale state win. Push has the
+    # no-regression guard as a backstop; pull writes to the card, so refuse.
+    can_pull = True
+    if args.direction in ("pull", "both"):
+        can_pull, why = device_clock_ok(device)
+        if not can_pull:
+            log(f"NOT pulling: {why}")
+        else:
+            log(f"clock: {why}")
 
     abs_ = Abs(args.abs_url, token)
-
-    # Default the finished rule to the library's own setting, so ABS remains
-    # the single place it is configured. ABS will not apply it to progress we
-    # PATCH in (verified: 30s remaining stays unfinished even with the setting
-    # at 10s, because the rule runs on ABS's own playback sessions), so we read
-    # the number and apply it ourselves.
     abs_secs, abs_pct = abs_.finished_rule(args.library_id)
     finished_secs = (args.finished_remaining_secs
                      if args.finished_remaining_secs is not None else abs_secs)
-    source = ("--finished-remaining-secs"
-              if args.finished_remaining_secs is not None
-              else "ABS markAsFinishedTimeRemaining")
+    src = ("--finished-remaining-secs"
+           if args.finished_remaining_secs is not None
+           else "ABS markAsFinishedTimeRemaining")
     if finished_secs:
-        log(f"finished when <= {finished_secs:g}s remain"
-            f" (capped at {args.finished_remaining_frac:g} of duration)"
-            f" [from {source}]")
+        log(f"finished when <= {finished_secs:g}s remain (capped at "
+            f"{args.finished_remaining_frac:g} of duration) [from {src}]")
     elif abs_pct:
-        log(f"finished at >= {abs_pct:g} complete"
-            f" [from ABS markAsFinishedPercentComplete]")
+        log(f"finished at >= {abs_pct:g} complete [from ABS]")
     else:
         log("no finished threshold configured: requires true end-of-file")
 
-    eps = abs_.episodes(args.library_id)
-    log(f"episodes known to ABS: {len(eps)}")
+    targets = abs_.episodes(args.library_id)
+    if args.book_library_id:
+        targets.update(abs_.books(args.book_library_id))
+    log(f"items known to ABS: {len(targets)}")
     prog = abs_.progress()
 
-    updates, unmatched, skipped = build_updates(
-        device, eps, prog, args.only_finished,
-        finished_secs, args.finished_remaining_frac, abs_pct,
-        args.allow_rewind)
+    actions, unmatched, skipped = reconcile(
+        device, targets, prog, direction=args.direction,
+        finished_secs=finished_secs, finished_frac=args.finished_remaining_frac,
+        finished_pct=abs_pct, allow_rewind=args.allow_rewind, can_pull=can_pull)
+
+    if args.only_finished:
+        actions = [a for a in actions
+                   if (a[0] == "push" and a[3]["finished"])
+                   or (a[0] == "pull" and a[3]["completed"])]
 
     for rel in unmatched:
         log(f"  no ABS match: {rel}")
     for msg in skipped:
         log(f"  skip: {msg}")
-    if not updates:
+    if not actions:
         log("nothing to update")
         return 0
 
     sent = failed = 0
-    for ep, st, body in updates:
-        if st["finished"]:
-            what = "played*" if st["by_threshold"] else "played"
+    for kind, dev, tgt, payload in actions:
+        if kind == "push":
+            what = ("played*" if payload["by_threshold"]
+                    else "played" if payload["finished"]
+                    else f"{payload['body'].get('currentTime', 0):.0f}s")
+            arrow = "->ABS"
         else:
-            what = f"{body.get('currentTime', 0):.0f}s"
+            what = ("played" if payload["completed"]
+                    else f"{payload['abs_secs']:.0f}s")
+            arrow = "->R1 "
         if args.dry_run:
-            log(f"  DRY  {what:>9}  {ep['rel']}")
+            log(f"  DRY  {arrow} {what:>9}  {dev['rel']}")
             continue
         try:
-            abs_.patch(
-                f"/me/progress/{ep['library_item_id']}/{ep['episode_id']}", body)
-            log(f"  sent {what:>9}  {ep['rel']}")
+            if kind == "push":
+                ep = f"/{tgt['episode_id']}" if tgt["episode_id"] else ""
+                abs_.patch(f"/me/progress/{tgt['library_item_id']}{ep}",
+                           payload["body"])
+            else:
+                write_pos(card, dev["book_id"], payload["ordinal"],
+                          payload["track_pos_ms"], payload["book_elapsed_ms"],
+                          payload["completed"], payload["saved_at"])
+            log(f"  sent {arrow} {what:>9}  {dev['rel']}")
             sent += 1
         except (urllib.error.URLError, OSError, ValueError) as exc:
-            log(f"  FAIL {what:>9}  {ep['rel']}: {exc}")
+            log(f"  FAIL {arrow} {what:>9}  {dev['rel']}: {exc}")
             failed += 1
 
     if args.dry_run:
-        log(f"dry run: {len(updates)} would be updated")
+        log(f"dry run: {len(actions)} would be updated")
     else:
         log(f"updated {sent}, failed {failed}")
     return 1 if (failed and args.strict) else 0
@@ -519,8 +726,8 @@ def main() -> int:
 
 if __name__ == "__main__":
     # The exit-0 guard exists so an unattended ChronoSync pre-sync failure
-    # cannot block a sync. It must NOT apply to --check, which is an
-    # interactive diagnostic whose whole job is to report failure.
+    # cannot block a sync. It must NOT apply to --check, an interactive
+    # diagnostic whose whole job is to report failure.
     _report = ("--strict" in sys.argv) or ("--check" in sys.argv)
     try:
         rc = main()

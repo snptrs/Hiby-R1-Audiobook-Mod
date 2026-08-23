@@ -108,254 +108,88 @@ browser, Bluetooth, USB, and system UI are otherwise untouched.
 - Episodes appear in **Continue** alongside books, so a part-heard episode is
   one tap from the Home screen.
 
-### Syncing listened state back to Audiobookshelf
+### Syncing listening state with Audiobookshelf
 
-`tools/abs_sync_listened.py` pushes podcast listening state from the SD card
-into Audiobookshelf. It needs no firmware involvement: the device already
-writes everything to the card (`.audiobook_pos/<book_id>.pos` for position and
-played state, `Audiobooks/.audiobook_library/library.db` to map ids to file
-paths), so the script is read-only with respect to the device.
+`tools/abs_sync_listened.py` reconciles listening state between the SD card and
+Audiobookshelf. It needs no firmware involvement: the device already writes
+everything to the card (`.audiobook_pos/<book_id>.pos` for position and played
+state, `Audiobooks/.audiobook_library/library.db` to map ids to paths).
 
 `tools/chronosync_presync_abs.sh` wraps it as a ChronoSync **pre-sync** hook.
-Pre-sync, so that played episodes are marked finished in ABS first, ABS then
-drops them from disk per its retention settings, and the sync propagates those
-deletions to the card. Deletions therefore flow Mac to card through the normal
-sync and the device never deletes anything.
+Pre-sync, so that played items are marked finished in ABS first, ABS then drops
+them from disk per its retention settings, and the sync propagates those
+deletions to the card. Media deletions flow Mac to card through the normal
+sync; this script only ever writes `.pos` files, never media.
 
-Three behaviours worth knowing:
+`--direction` selects what it does:
 
+| | |
+|---|---|
+| `push` | device to ABS. Read-only with respect to the card. |
+| `pull` | ABS to device. **Writes `.pos` files.** |
+| `both` | two-way. What the wrapper uses. |
+
+Podcasts are always included. Audiobooks are included when
+`--book-library-id` is given; the wrapper sets it.
+
+Behaviours worth knowing:
+
+- **The more recent save wins**, comparing the device's `.pos` timestamp against
+  the ABS `lastUpdate`. A pull writes ABS's timestamp into the `.pos` rather
+  than the current time, so the two sides cannot ping-pong.
+- **Neither side is ever rewound.** If one is behind the other, the update is
+  skipped and logged. A brief tap on the device is "newer" than a real position
+  set in the web player, and pushing it would destroy listening state.
+  `--allow-rewind` overrides.
 - **Near-end counts as finished, using the ABS library's own setting.** The
   firmware only sets `completed` when the decoder runs off the true end of a
-  file, with no percentage threshold, so stopping during a podcast outro
-  leaves an episode unfinished forever. The threshold defaults to the
-  library's `markAsFinishedTimeRemaining`, so ABS stays the one place it is
-  configured. ABS does not apply that setting to progress pushed over its
-  API (verified: at 30s remaining a write stays unfinished even with the
-  setting at 10s, because the rule runs on ABS's own playback sessions), so
-  the script reads the number and does the applying. It additionally caps the
-  allowance at 10% of duration so a short episode is not called finished too
-  early. Override with `--finished-remaining-secs` / `--finished-remaining-frac`.
-- **It never rewinds a position.** If the device is behind what ABS already
-  has, the update is skipped and logged. A brief tap on the device is "newer"
-  than a genuine position set in the web player, and pushing it would destroy
-  real listening state. Override with `--allow-rewind` if you ever need to.
-- **Repeat runs are no-ops.** Conflicts are resolved by comparing the device's
-  `.pos` timestamp against the ABS `lastUpdate`, so syncing twice changes
-  nothing and a position advanced in the web player is not dragged backwards.
+  file, so stopping during a podcast outro would leave an item unfinished
+  forever. The threshold defaults to the library's
+  `markAsFinishedTimeRemaining`, so ABS stays the one place it is configured.
+  ABS does not apply that setting to progress pushed over its API (verified: at
+  30s remaining a write stays unfinished even with the setting at 10s, because
+  the rule runs on ABS's own playback sessions), so the script reads the number
+  and applies it. It caps the allowance at 10% of duration so short episodes
+  are not called finished too early.
+- **Pulling refuses to run if the device clock looks wrong.** Ordering depends
+  on the `.pos` timestamps, so a device clock in the future would let stale
+  state overwrite good state on the card.
+- **A multi-file audiobook is skipped unless the device and ABS agree on its
+  total duration.** The device sums its own track durations in its own order
+  and ABS concatenates in its; if the totals disagree the timelines differ and
+  a mapped position would land somewhere else entirely. Single-file items have
+  nothing to disagree about.
 
 Always try `--dry-run` first, or `HIBY_ABS_DRY_RUN=1` for the wrapper.
+`tools/test_abs_sync_reconcile.py` unit-tests the decision logic with no card,
+network or ABS instance.
 
 **Setting it up on another Mac.** The sync script is standard library only, so
 system `python3` is enough: no Homebrew, no pip, and none of the firmware build
 toolchain. The wrapper locates the script relative to itself, so the repo can
-live anywhere and the file needs no editing. Clone the repo, write the ABS API
-token to `~/.config/abs/token` (`chmod 600`), then verify everything in one
-step with the card mounted:
+live anywhere and needs no editing. Clone the repo, write the ABS API token to
+`~/.config/abs/token` (`chmod 600`), then verify with the card mounted:
 
 ```bash
 python3 tools/abs_sync_listened.py \
   --abs-url http://YOUR-ABS-HOST:13378 \
-  --library-id YOUR-PODCAST-LIBRARY-ID --check
+  --library-id YOUR-PODCAST-LIBRARY-ID \
+  --book-library-id YOUR-AUDIOBOOK-LIBRARY-ID --check
 ```
 
-`--check` validates the token, ABS reachability and auth, that the library is
-really a podcast library, and that the card is mounted with a `books.kind`
-column. It changes nothing and exits non-zero on failure. Then point ChronoSync
-at `tools/chronosync_presync_abs.sh`.
+`--check` validates the token, ABS reachability and auth, that each library is
+the expected media type, that the card is mounted with a `books.kind` column,
+and that the device clock is sane. It changes nothing and exits non-zero on
+failure. Then point ChronoSync at `tools/chronosync_presync_abs.sh`.
 
-If the ABS URL or library id differ from the defaults baked into the wrapper,
-override them in `~/.config/abs/config`:
+Override the defaults baked into the wrapper in `~/.config/abs/config`:
 
 ```
 HIBY_ABS_URL=http://other-host:13378/audiobookshelf
 HIBY_ABS_LIBRARY_ID=...
+HIBY_ABS_BOOK_LIBRARY_ID=...
+HIBY_ABS_DIRECTION=push
 ```
-
-**Library**
-
-- Home menu: Continue, Titles, Authors, Podcasts, Folders, Finished, Refresh.
-- Folders follows the real `/Audiobooks` directory hierarchy instead of showing
-  a flattened list. Folder taps use a cached row and one indexed subtree query,
-  keeping navigation responsive even with a large catalog.
-- Refresh Library runs in the background with visible progress, so playback,
-  touch, and hardware controls remain responsive during a scan.
-- Audiobooks are automatically removed from HiBy's Music catalog whenever the
-  Audiobooks app opens. This works regardless of whether Music Update Database
-  or Audiobooks Refresh Library was run last.
-- Book detail pages show publisher descriptions from MP3 `COMM` or M4B
-  `desc`/`ldes` metadata when available. Summaries use the full screen width,
-  while progress and the four controls remain anchored at the bottom.
-- Scrollable list views with **cover-art thumbnails** — JPEG via `dlopen`'d
-  libjpeg and PNG via a self-contained streaming decoder over `dlopen`'d `libz`,
-  decode-on-demand with a progressive-JPEG guard so huge covers bail gracefully
-  instead of OOM-freezing.
-- Swipe left from a list -> Now Playing.
-
-**Playback**
-
-- **MP3** and **M4B/AAC** (AAC via the device's `libfdk-aac`, `dlopen`'d).
-- **Per-book + multipart resume** across reboots and book switching, with a
-  5-second smart rewind on resume. Positions are **SD-primary** (one tiny file
-  per book on the SD card) so they survive even a full internal data partition;
-  the SQLite DB is a best-effort mirror. Playing positions checkpoint every 15
-  seconds, the DB mirror is limited to once per minute, and the exact position is
-  saved immediately on pause, stop, completion, and app exit. A book must play
-  for at least 15 seconds before its first periodic checkpoint.
-- **Now Playing**: a larger 270-pixel cover, title/author/duration, and a
-  **draggable progress handle** in a compact lower information area (scrub
-  seek; tapping the bar elsewhere does not jump).
-- **Playback speed** 1.0 / 1.1 / 1.25 / 1.5 / 2.0x via **WSOLA time-stretch**
-  (pitch preserved; 1.0x exact passthrough). Persists.
-- Now Playing Prev/Next rewind 30 seconds and advance 60 seconds, clamped to
-  the beginning/end of the book.
-- **Sleep timer** Off / 15 / 30 / 60 min with live countdown; auto-pauses and
-  saves on expiry.
-- **M4B chapters** parsed from the embedded QuickTime chapter track (stsc-aware)
-  or Nero `chpl`. MP3 files with ID3v2.3/v2.4 `CHAP`/`CTOC` metadata expose
-  their embedded chapters; multipart MP3 books without embedded chapters still
-  get one chapter per file. Tap a chapter to seek directly.
-- **Bookmarks**: tap **Mark** on Now Playing to add; tap to jump; long-press to
-  delete. Bookmarks are **SD-primary** — one tiny `<book_id>.bm` file per book on
-  the SD card, written atomically (temp then rename) so a power cut cannot
-  corrupt an existing set. A full internal data partition can never lose or
-  refuse a bookmark, and existing in-DB bookmarks migrate to SD automatically
-  the first time a book's bookmark screen is opened.
-- **Bluetooth A2DP output**: streams to paired Bluetooth headphones/speakers
-  (BlueALSA `pcm.bluealsa` plug, auto rate/format conversion), with AVRCP
-  play/pause from the remote. Auto-detect at track open; falls back to the wired
-  output automatically when no BT sink is connected or the transport drops
-  mid-playback (retry-then-fallback, no auto-switch-back until the next track
-  open). Bluetooth mixer state is retried and tracked separately from wired
-  volume to prevent startup and pause/resume volume jumps. On exit over BT the
-  stock player is handed back **paused**, so music no longer auto-plays over the
-  speaker when you leave the app.
-
-**Hardware**
-
-- Power button toggles backlight (audio keeps playing dark; double-tap wakes).
-- Stock hard-screen blanks are converted to the app's lightweight screen-off
-  state. If the panel ever enters that state unexpectedly, the next power,
-  media, or volume input explicitly restores the framebuffer before acting.
-- Play/pause, prev/next, volume keys in-app. Volume is fine-stepped (~2-2.5 dB)
-  with hold-to-ramp and a temporary on-screen volume indicator.
-- Rapid button presses are queued in order instead of overwriting one another.
-- Back is always top-left on every in-app screen.
-- The launcher uses HiBy's stock Books icon resources, so Audiobooks remains
-  readable in both light and dark themes.
-
-**USB storage and development ADB**
-
-- Public builds leave persistent ADB off, restoring normal SD-card mounting on
-  a connected computer.
-- Manual ADB mode keeps the SD mounted locally for audiobook/music access and
-  cleans stale USB gadget state before taking control of USB.
-- Returning to mass storage first unmounts the local SD cleanly. If an app is
-  still using the card, the transition is refused instead of exposing a live
-  filesystem to the computer.
-- ADB, USB mass storage, and USB DAC share one USB controller and remain
-  mutually exclusive.
-
-**SD-card stability (since v2.0.23)**
-
-- While Audiobooks is open, the app keeps the removable-card platform, host,
-  and card runtime-power controls active. This avoids the stock Ingenic X1600
-  MMC driver's rapid three-second suspend/resume cycle while the app is reading
-  media and writing resume data.
-- Leaving Audiobooks restores each control to its previous value, normally
-  `auto`, so the SD card can suspend normally in the stock launcher and Music
-  player. There is no always-running daemon and no global power-management
-  change.
-- A lightweight 30-second health check only logs repeated missing MMC-worker or
-  non-active runtime states. It never reboots the device.
-
-**Restored stock unlocks (since v2.0.17)**
-
-- These three general device/music unlocks were carried by every pre-2.0 release
-  (v1.5.0-v1.6.3) and were dropped at the v2.0.0 NativeApp pivot; v2.0.17 turns
-  them back on. They are pure stock-resource / shell-config tweaks (no binary,
-  boot, PMIC, or mount changes), so the audiobook app and hook are unchanged from
-  v2.0.16.
-- **USB DAC mode**: unlocks the USB-DAC working mode and related Settings flags,
-  so you can set System -> USB working mode to **DAC** and use the R1 as a USB
-  DAC. USB DAC, USB storage, and manually enabled ADB share the single USB
-  gadget controller and are mutually exclusive.
-- **Native DSD**: sets `AnalogDsdNative: native` on the analog output device in
-  `ot_devices.json`, enabling native DSD on the analog output path for the stock
-  Music player (was `dop`).
-- **Bluetooth SBC XQ**: adds `--sbc-quality=xq` to the BlueALSA launch in
-  `/usr/bin/bt_init`, raising SBC encoding quality when the receiving device
-  supports it. Because the audiobook app drives `pcm.bluealsa` directly for BT
-  output, this applies to audiobook-over-BT as well as stock music.
-
-## Expected behavior
-
-- **First run with an SD card:** put audiobooks under `/Audiobooks`, open the
-  Audiobooks tile, and tap **Refresh Library**. The screen shows a
-  "Refreshing library..." banner, then a green confirmation flash. This
-  scans `/Audiobooks`, builds the library DB, and caches chapters. Music under
-  `/Music` is unaffected. The scan runs on a worker connection and does not
-  block audiobook playback or controls.
-- **Re-scanning after a chapter fix:** Refresh re-parses M4B chapters, so if a
-  book showed only one chapter it will be replaced with the full list after a
-  Refresh.
-- **Large libraries:** the M4B chapter parser memory-maps the `moov` atom
-  instead of loading it into RAM, so books with large (15 MB+) `moov` atoms no
-  longer run out of memory and freeze the scan.
-- **Storage-full guard:** if the internal data partition has too little free
-  space to write the library DB, the scan aborts cleanly with a red on-screen
-  error flash instead of stalling. (The internal partition is chronically near
-  full because the stock music database rebuilds on every boot.)
-- **SD-card interruption guard:** a read failure or unavailable audiobook path
-  stops playback without marking the book complete or overwriting its saved
-  position.
-- **Resume persistence:** periodic position files are written every 15 seconds.
-  Pause, stop, completion, and app exit save immediately. The less-frequent
-  SQLite mirror is only for list progress and does not control the authoritative
-  resume position.
-- **Leaving the app:** when you swipe or back out of the Audiobooks app to the
-  HiBy launcher, **audiobook playback stops**. Audio is tied to the app being
-  open. Exiting while playing returns cleanly to the launcher (no black screen,
-  no power-button kick needed). Background playback on the launcher is a
-  planned future improvement, not in this release.
-- **Resume:** opening a book you were listening to resumes near your last
-  position, rewound 5 seconds. Bookmark and chapter jumps go to the exact
-  saved timestamp.
-
-## Install
-
-1. Download `r1-audiobooks-2.0.28.upt` from the release page.
-2. Rename it to exactly `r1.upt` (the R1 will not recognize the update otherwise).
-3. Copy it to the root of the SD card.
-4. On the R1, run the normal firmware update
-   (System -> Firmware update -> Via SD-card).
-5. Wait for success and the reboot.
-6. After boot, delete or rename `r1.upt` on the SD card so the updater stops
-   offering it.
-7. Open the Audiobooks tile and tap **Refresh Library** to scan `/Audiobooks`.
-   Run this once after upgrading so existing books gain description metadata.
-
-Recommended SD-card layout:
-
-```text
-/Music
-/Audiobooks/Author/Year - Book Title/01 - Chapter.mp3
-/Audiobooks/Author/Year - Book Title/Book Title.m4b
-```
-
-Metadata that helps: Album = book title, Title = chapter/file title,
-Album artist = author, numbered files for multipart books, and Publisher
-Summary = MP3 Comment (`COMM`) or M4B Description (`desc`/`ldes`). The app
-derives fallbacks from folders/filenames when tags are missing. The genre tag does not
-need to be `Audiobook` - anything under `/Audiobooks` is treated as one. External
-cover art is picked up from `cover.jpg` / `cover.png` / `cover.jpeg` /
-`folder.jpg` / `folder.png` in the book folder; otherwise the embedded MP3 APIC
-or M4B `covr` art is used.
-
-## Building from source
-
-The firmware is built offline from the extracted stock 1.6 rootfs plus the
-audiobook app. The audiobook app (`audiobook_app/`) is cross-compiled to MIPS32
-with `zig cc` (target `mipsel-linux-gnueabihf.2.22`).
 
 ### macOS / Linux
 

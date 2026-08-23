@@ -1,6 +1,7 @@
 #!/bin/bash
-# ChronoSync PRE-sync hook: push HiBy R1 podcast listening state into
-# Audiobookshelf before the sync runs.
+# ChronoSync PRE-sync hook: reconcile HiBy R1 listening state with
+# Audiobookshelf before the sync runs. Two-way by default, covering both
+# podcasts and audiobooks.
 #
 # Pre-sync, not post-sync, so the ordering works out:
 #   1. this marks played episodes finished in ABS
@@ -47,7 +48,11 @@ CONFIG="$HOME/.config/abs/config"
 
 ABS_URL="${HIBY_ABS_URL:-http://seans-imac:13378/audiobookshelf}"
 LIBRARY_ID="${HIBY_ABS_LIBRARY_ID:-e92e1153-f83a-4a6a-a3f6-235758222e67}"
+BOOK_LIBRARY_ID="${HIBY_ABS_BOOK_LIBRARY_ID:-a7a8932b-049d-46ce-84eb-61effc98cfee}"
 TOKEN_FILE="${HIBY_ABS_TOKEN_FILE:-$HOME/.config/abs/token}"
+# both = two-way. This is the only setting that lets the script WRITE to the
+# card (.pos files only, never media). Set to push for read-only behaviour.
+DIRECTION="${HIBY_ABS_DIRECTION:-both}"
 
 # System python3 first: it is the one guaranteed to exist, and a Homebrew
 # upgrade cannot break the hook.
@@ -80,9 +85,13 @@ fi
       extra="--dry-run"
       echo "(dry run: HIBY_ABS_DRY_RUN=1)"
     fi
+    book_arg=""
+    [ -n "${BOOK_LIBRARY_ID:-}" ] && book_arg="--book-library-id $BOOK_LIBRARY_ID"
     "$PYTHON" "$SCRIPT" \
       --abs-url "$ABS_URL" \
       --library-id "$LIBRARY_ID" \
+      $book_arg \
+      --direction "$DIRECTION" \
       --token-file "$TOKEN_FILE" \
       $extra 2>&1
     echo "(script exit: $?)"
