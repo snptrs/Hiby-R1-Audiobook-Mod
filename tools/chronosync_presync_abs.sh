@@ -72,7 +72,15 @@ if [ -f "$LOG" ]; then
 fi
 
 {
-  echo "=== $(date '+%Y-%m-%d %H:%M:%S') pre-sync on $(hostname -s) ==="
+  # Record which commit produced this run. After a git pull, the log is then
+  # the answer to "is ChronoSync actually running the new code?" without having
+  # to infer it from which messages appear. Best-effort: a copy taken outside a
+  # git checkout just shows "unknown".
+  rev="$(git -C "$TOOLS" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  dirty=""
+  git -C "$TOOLS" diff --quiet -- "$TOOLS" 2>/dev/null || dirty="+local-changes"
+  echo "=== $(date '+%Y-%m-%d %H:%M:%S') pre-sync on $(hostname -s)" \
+       "[$rev$dirty] ==="
   if [ -z "${PYTHON:-}" ] || [ ! -x "$PYTHON" ]; then
     echo "no python3 found; skipping"
   elif [ ! -f "$SCRIPT" ]; then
