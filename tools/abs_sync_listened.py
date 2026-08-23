@@ -56,6 +56,9 @@ KIND_BOOK, KIND_PODCAST = 0, 1
 # A device clock this far ahead of ours means .pos timestamps cannot be trusted
 # to order against ABS lastUpdate, so pulling is unsafe.
 CLOCK_SKEW_TOLERANCE_S = 3600
+# Above this much ahead, warn: still ordered, but a device position can beat a
+# genuinely newer ABS change made inside the skew window.
+CLOCK_WARN_AHEAD_S = 120
 # For a multi-file book, both directions assume the device's track order and
 # ABS's concatenation produce the same timeline. Agreeing totals is the
 # available proxy for that.
@@ -355,6 +358,11 @@ def near_end(elapsed_s: float, duration: float | None,
 # stores integer ms and ABS a float of seconds, so exact equality never holds.
 SAME_POSITION_S = 1.0
 
+# A few seconds of playback is not a listening position, it is a stray tap.
+# Syncing those just fills Continue Listening on both sides with noise, so an
+# unfinished position below this is ignored. Finishing is always synced.
+DEFAULT_MIN_POSITION_S = 30.0
+
 
 def materially_same(dev_secs: float | None, dev_fin: bool,
                     abs_secs: float | None, abs_fin: bool) -> bool:
@@ -395,6 +403,7 @@ def reconcile(device: dict[str, dict], targets: dict[str, dict],
               direction: str, finished_secs: float | None,
               finished_frac: float | None, finished_pct: float | None,
               allow_rewind: bool, can_pull: bool,
+              min_position_s: float = DEFAULT_MIN_POSITION_S,
               rewind_grace_s: float = 60.0) -> tuple[list, list, list]:
     """Pure decision step. Returns (actions, unmatched, skipped).
 
@@ -457,6 +466,8 @@ def reconcile(device: dict[str, dict], targets: dict[str, dict],
                     continue
                 body["isFinished"] = True
             else:
+                if dev_secs < min_position_s:
+                    continue
                 body["currentTime"] = round(dev_secs, 3)
                 if dur:
                     body["duration"] = dur
@@ -476,6 +487,8 @@ def reconcile(device: dict[str, dict], targets: dict[str, dict],
                 skipped.append(
                     f"{dev['rel']}: ABS {abs_secs:.0f}s is behind device "
                     f"{dev_secs:.0f}s, not rewinding the device")
+                continue
+            if not abs_fin and abs_secs < min_position_s:
                 continue
             # A finished ABS item reports currentTime 0, so write elapsed 0 and
             # let the completed flag stand: the player restarts a finished item
@@ -500,19 +513,30 @@ def reconcile(device: dict[str, dict], targets: dict[str, dict],
 def device_clock_ok(device: dict[str, dict]) -> tuple[bool, str]:
     """Are the device's .pos timestamps usable for ordering against ABS?
 
-    Pull direction depends on comparing them, so a badly wrong device clock
-    would let the wrong side win. A clock in the future is the detectable case;
-    the Mac's own clock is assumed sane (it is NTP-synced).
+    Ordering compares them against ABS lastUpdate, so a device clock running
+    AHEAD is the dangerous direction: a .pos written at real time T looks like
+    T+skew, so it beats any ABS change made in that window even though ABS is
+    genuinely newer. A clock running behind biases the other way, which the
+    no-regression guard already limits. The Mac's clock is assumed sane.
+
+    Report the direction explicitly. Saying only "0.5h from now" hides which
+    way, and the two directions differ in how much they can hurt.
     """
     stamps = [d["pos"]["saved_at"] for d in device.values() if d["pos"]]
     if not stamps:
         return True, "no saved positions to check"
-    newest = max(stamps)
-    skew = newest - int(time.time())
+    skew = max(stamps) - int(time.time())
     if skew > CLOCK_SKEW_TOLERANCE_S:
-        return False, (f"device clock looks {skew / 3600:.1f}h ahead "
-                       f"(newest .pos is in the future)")
-    return True, f"newest .pos {abs(skew) / 3600:.1f}h from now"
+        return False, (f"device clock is {skew / 3600:.1f}h AHEAD of this Mac; "
+                       f"refusing to pull, positions cannot be ordered")
+    if skew > CLOCK_WARN_AHEAD_S:
+        return True, (f"WARNING device clock is ~{skew / 60:.0f} min AHEAD of "
+                      f"this Mac, so a device position can wrongly beat an ABS "
+                      f"change made in that window. Set the R1's clock.")
+    if skew < -CLOCK_SKEW_TOLERANCE_S:
+        return True, (f"device clock is {-skew / 3600:.1f}h behind this Mac "
+                      f"(biases toward ABS; less harmful, still worth fixing)")
+    return True, f"device clock within {abs(skew) / 60:.0f} min of this Mac"
 
 
 def run_check(args) -> int:
@@ -615,6 +639,12 @@ def main() -> int:
                     # Not an ABS concept; ours, to protect short episodes.
                     help="cap the above at this fraction of the item, so short "
                          "episodes need a tighter margin (default 0.10)")
+    ap.add_argument("--min-position-secs", type=float,
+                    default=DEFAULT_MIN_POSITION_S,
+                    help="ignore unfinished positions shorter than this, on "
+                         "both sides, so a stray tap does not become a "
+                         "Continue Listening entry (default 30). Finishing is "
+                         "always synced.")
     ap.add_argument("--allow-rewind", action="store_true",
                     help="permit moving a position EARLIER on either side "
                          "(off by default: it destroys real listening state)")
@@ -673,7 +703,8 @@ def main() -> int:
     actions, unmatched, skipped = reconcile(
         device, targets, prog, direction=args.direction,
         finished_secs=finished_secs, finished_frac=args.finished_remaining_frac,
-        finished_pct=abs_pct, allow_rewind=args.allow_rewind, can_pull=can_pull)
+        finished_pct=abs_pct, allow_rewind=args.allow_rewind,
+        can_pull=can_pull, min_position_s=args.min_position_secs)
 
     if args.only_finished:
         actions = [a for a in actions

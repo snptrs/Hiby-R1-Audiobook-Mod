@@ -13,7 +13,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from abs_sync_listened import (  # noqa: E402
-    KIND_BOOK, KIND_PODCAST, reconcile, split_position, timeline_trustworthy,
+    KIND_BOOK, KIND_PODCAST, device_clock_ok, reconcile, split_position,
+    timeline_trustworthy,
 )
 
 NOW = int(time.time())
@@ -86,7 +87,8 @@ a, _, s = run(dev("a.mp3", 1096, when=NOW - 999), tgt("a.mp3"), prog(19, when=NO
 check("ABS behind device does not rewind device", a, [])
 check("  and says why", "not rewinding the device" in s[0], True)
 
-a, _, _ = run(dev("a.mp3", 19, when=NOW), tgt("a.mp3"), prog(1096, when=NOW - 9),
+# Above the minimum-position floor, so this exercises the rewind guard alone.
+a, _, _ = run(dev("a.mp3", 100, when=NOW), tgt("a.mp3"), prog(1096, when=NOW - 9),
               allow_rewind=True)
 check("--allow-rewind overrides", [x[0] for x in a], ["push"])
 
@@ -123,6 +125,33 @@ check("no ABS counterpart is reported, not synced", (acts, unmatched),
       ([], ["a.mp3"]))
 acts, _, _ = run(dev("a.mp3"), tgt("a.mp3"), {})
 check("never played on either side does nothing", acts, [])
+
+print("minimum position floor")
+a, _, _ = run(dev("a.mp3", 19, when=NOW), tgt("a.mp3"), {})
+check("a stray 19s push is ignored", a, [])
+a, _, _ = run(dev("a.mp3", 19, when=NOW), tgt("a.mp3"), {}, min_position_s=0)
+check("  unless the floor is lowered", [x[0] for x in a], ["push"])
+a, _, _ = run(dev("a.mp3", 200, when=NOW), tgt("a.mp3"), {})
+check("a real 200s push still goes", [x[0] for x in a], ["push"])
+a, _, _ = run(dev("a.mp3", 5, when=NOW - 999), tgt("a.mp3"), prog(3, when=NOW))
+check("a stray 3s pull is ignored", a, [])
+a, _, _ = run(dev("a.mp3", 3599, completed=True, when=NOW), tgt("a.mp3"), {})
+check("finishing is never floored out", [x[3]["finished"] for x in a], [True])
+
+print("clock skew reporting")
+def clockdev(offset):
+    return {"k": {"pos": {"saved_at": NOW + offset}}}
+ok, why = clockdev, None
+ok, why = device_clock_ok(clockdev(0))
+check("in sync -> ok", (ok, "within" in why), (True, True))
+ok, why = device_clock_ok(clockdev(1800))
+check("30 min ahead -> allowed but warns", (ok, "WARNING" in why and "AHEAD" in why),
+      (True, True))
+ok, why = device_clock_ok(clockdev(7200))
+check("2h ahead -> refuses to pull", (ok, "refusing to pull" in why), (False, True))
+ok, why = device_clock_ok(clockdev(-7200))
+check("2h behind -> allowed, names the direction",
+      (ok, "behind" in why), (True, True))
 
 print("pull safety")
 a, _, _ = run(dev("a.mp3", 50, when=NOW - 999), tgt("a.mp3"), prog(900, when=NOW),
