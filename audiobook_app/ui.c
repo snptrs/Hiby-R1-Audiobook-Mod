@@ -1343,6 +1343,16 @@ static void navigate_back(ui_state_t *ui) {
     }
 }
 
+/* Collapse the whole nav stack back to Home (long-press on the title bar).
+ * Playback is untouched; swipe-left still jumps back to Now Playing. */
+static void navigate_home(ui_state_t *ui) {
+    if (ui->screen == SCREEN_HOME) return;
+    ui->nav_depth = 0;
+    ui->folder_path[0] = '\0';
+    set_nav_destination(ui, SCREEN_HOME, ui->list_mode, 0);
+    rebuild_screen(ui);
+}
+
 /* ---- Event handlers (forward-declared in ui.h) ------------------------- */
 
 int ui_handle_tap(ui_state_t *ui, int x, int y) {
@@ -1357,9 +1367,14 @@ int ui_handle_tap(ui_state_t *ui, int x, int y) {
     }
 }
 
-/* Long-press (finger held > ~600ms with minimal movement). Used on the
- * Bookmarks screen to delete a bookmark (tap jumps to it instead). */
+/* Long-press (finger held > ~600ms with minimal movement). Title bar =
+ * jump to Home (tap = one level back); Bookmarks rows = delete a bookmark
+ * (tap jumps to it instead). */
 static int ui_handle_longpress(ui_state_t *ui, int x, int y) {
+    if (ui->screen != SCREEN_HOME && y < TITLE_BAR_H) {
+        navigate_home(ui);
+        return 1;
+    }
     switch (ui->screen) {
         case SCREEN_BOOKMARKS: return handle_bookmarks_longpress(ui, x, y);
         default: return 0;

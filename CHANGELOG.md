@@ -4,6 +4,13 @@ All public releases are for the normal HiBy R1 on stock firmware 1.6. Do not ins
 
 ## Unreleased - podcast support
 
+### Added: long-press the title bar to jump straight Home
+
+Tap on the title bar still goes one level back. Getting from a book's chapter
+list to Home meant three or four taps; the long-press collapses the whole nav
+stack in one gesture. Playback is untouched and swipe-left still returns to Now
+Playing.
+
 ### Changed: only the power button wakes a blanked screen
 
 Neither the touchscreen nor any other hardware key wakes it now. Volume,
