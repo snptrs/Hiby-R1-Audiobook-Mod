@@ -120,7 +120,7 @@ assets through the GitHub release API.
 ## Known Limitations
 
 - Audiobook playback stops when leaving the app for the HiBy launcher.
-- No audiobook search UI; browse Titles, Authors, Series, or Folders.
+- No audiobook search UI; browse Continue, Authors, or Podcasts.
 - ADB, USB mass storage, and USB DAC are mutually exclusive. Persistent ADB is
   not included in the public build.
 - UTF-8/Cyrillic text support from v2.0.20 is not included in this stability

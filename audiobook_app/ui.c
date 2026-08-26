@@ -3,10 +3,10 @@
  * Runs inside hook_b when the user taps the Audiobooks tile. Renders to
  * hiby_player's mmap'd framebuffer, reads touch from /dev/input/event1.
  *
- * The home screen shows: Continue Listening, Titles, Authors, Series,
- * Folders, Finished, Refresh, Back. Touch items navigate to list/detail
- * screens. Back returns to the launcher. (ADB is always on at boot via the
- * firmware's S90adb init script when System -> USB working mode = Device.)
+ * The home screen shows: Continue Listening, Authors, Podcasts, Refresh,
+ * Back. Touch items navigate to list/detail screens. Back returns to the
+ * launcher. (ADB is always on at boot via the firmware's S90adb init script
+ * when System -> USB working mode = Device.)
  */
 
 #include <stdio.h>
@@ -74,14 +74,15 @@
  * its label at 722, colliding with the refresh/error flash at y=720, and the
  * footer text at 766 would land inside it. draw_home never reads scroll_offset
  * and screen_is_scrollable excludes SCREEN_HOME, so there is no scrolling to
- * fall back on. Podcasts therefore REPLACES Series rather than being added. */
+ * fall back on.
+ *
+ * home_labels is a parallel array sized [HOME_ITEM_COUNT]; edit both together.
+ * The build has no -Wall, so shortening only the labels leaves NULL entries
+ * that draw_home dereferences. */
 typedef enum {
     HOME_CONTINUE = 0,
-    HOME_TITLES,
     HOME_AUTHORS,
     HOME_PODCASTS,
-    HOME_FOLDERS,
-    HOME_FINISHED,
     HOME_REFRESH,
     HOME_BACK,
     HOME_ITEM_COUNT
@@ -89,11 +90,8 @@ typedef enum {
 
 static const char *home_labels[HOME_ITEM_COUNT] = {
     "Continue",
-    "Titles",
     "Authors",
     "Podcasts",
-    "Folders",
-    "Finished",
     "Refresh Library",
     "Back to Menu",
 };
@@ -1441,10 +1439,9 @@ static void draw_home(ui_state_t *ui) {
 
     /* Cached home counts (built by rebuild_home on the event thread). Read
      * under the cache lock; stale-by-one-frame is harmless. */
-    int home_cont, home_fin, home_total;
+    int home_cont, home_total;
     pthread_mutex_lock(&g_cache_lock);
     home_cont = ui->home_continue_n;
-    home_fin = ui->home_finished_n;
     home_total = ui->home_total_n;
     pthread_mutex_unlock(&g_cache_lock);
 
@@ -1459,14 +1456,6 @@ static void draw_home(ui_state_t *ui) {
         /* Show continue count */
         if (i == HOME_CONTINUE) {
             int count = home_cont;
-            if (count > 0) {
-                char buf[16];
-                snprintf(buf, sizeof(buf), "%d", count);
-                render_text_right(r, RENDER_FB_W - 24, y + 22, buf,
-                                  FONT_SCALE_2, COL_GRAY_LT);
-            }
-        } else if (i == HOME_FINISHED) {
-            int count = home_fin;
             if (count > 0) {
                 char buf[16];
                 snprintf(buf, sizeof(buf), "%d", count);
@@ -1516,21 +1505,11 @@ static int handle_home_touch(ui_state_t *ui, int x, int y) {
         case HOME_CONTINUE:
             navigate_to(ui, SCREEN_LIST, LIST_CONTINUE, 0);
             break;
-        case HOME_TITLES:
-            navigate_to(ui, SCREEN_LIST, LIST_TITLES, 0);
-            break;
         case HOME_AUTHORS:
             navigate_to(ui, SCREEN_LIST, LIST_AUTHORS, 0);
             break;
         case HOME_PODCASTS:
             navigate_to(ui, SCREEN_LIST, LIST_SHOWS, 0);
-            break;
-        case HOME_FOLDERS:
-            ui->folder_path[0] = '\0';   /* Folders tile always starts at root */
-            navigate_to(ui, SCREEN_LIST, LIST_FOLDERS, 0);
-            break;
-        case HOME_FINISHED:
-            navigate_to(ui, SCREEN_LIST, LIST_FINISHED, 0);
             break;
         case HOME_REFRESH: {
             int started = scan_worker_start();
@@ -1822,11 +1801,9 @@ static void free_strlist(strlist_ctx_t *sc) {
 
 static void rebuild_home(ui_state_t *ui) {
     int cont = audiobook_list_continue(ui->db, NULL, NULL);
-    int fin = audiobook_list_finished(ui->db, NULL, NULL);
     int total = audiobook_list_books(ui->db, NULL, NULL);
     pthread_mutex_lock(&g_cache_lock);
     ui->home_continue_n = cont;
-    ui->home_finished_n = fin;
     ui->home_total_n = total;
     pthread_mutex_unlock(&g_cache_lock);
 }

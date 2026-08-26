@@ -38,7 +38,7 @@ the original resume/sequential-playback foundation:
   chapter tracks; MP3 chapters are parsed from ID3v2.3/v2.4 `CHAP`/`CTOC`
   frames. Metadata is re-read at scan time (Home → Refresh). MP3 files without
   embedded chapters retain the one-synthesized-chapter-per-track fallback.
-- Library lists (Titles/Authors/Series/Folders/Finished) with on-demand
+- Library lists (Continue/Authors/Podcasts) with on-demand
   thumbnails (progressive-JPEG-guarded pre-warm).
 - Swipe left → Now Playing.
 

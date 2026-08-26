@@ -38,6 +38,9 @@ typedef enum {
  * list_mode, not list_is_strlist, so a missing entry renders fine and then
  * no-ops on tap). The build has no -Wall, so nothing warns. */
 typedef enum {
+    /* TITLES/FOLDERS/FINISHED have no Home entry point and are unreachable.
+     * LIST_TITLES stays at 0 because ui_run memsets ui_state_t: renumbering
+     * would make a zero-initialised list_mode a strlist mode. */
     LIST_TITLES = 0,
     LIST_AUTHORS,
     LIST_SERIES,
@@ -253,7 +256,6 @@ typedef struct {
      * never races the event thread. Single non-nested lock → no deadlock. */
     /* Home screen counts. */
     int home_continue_n;
-    int home_finished_n;
     int home_total_n;
 
     /* List screen cache. list_is_strlist selects the active array: Authors/

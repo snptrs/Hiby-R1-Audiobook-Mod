@@ -4,6 +4,14 @@ All public releases are for the normal HiBy R1 on stock firmware 1.6. Do not ins
 
 ## Unreleased - podcast support
 
+### Changed: trimmed the Audiobooks home menu to five items
+
+Titles, Folders and Finished are gone. Home is now Continue, Authors,
+Podcasts, Refresh Library, Back to Menu. Every book is still reachable through
+Authors, and dropping Finished also drops a `SELECT` that ran on every home
+rebuild just to feed its count badge. The list views behind those three rows
+are left in place but no longer reachable.
+
 ### Added: long-press the title bar to jump straight Home
 
 Tap on the title bar still goes one level back. Getting from a book's chapter
